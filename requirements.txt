@@ -1,0 +1,6 @@
+asyncio
+PySocks
+telethon
+opentele
+2captcha-python
+aiogram
