@@ -87,6 +87,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", read_secret(BOT_TOKEN_FILE))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Следующий пост при нажатии «Смотреть посты» (по user_id).
+VIEWER_OFFSET: dict[int, int] = {}
+
 
 class CreatePost(StatesGroup):
     waiting_content = State()
@@ -821,20 +824,21 @@ def rating_kb(chat_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def post_nav_kb(post_id: int, offset: int, total: int) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="💬 Начать чат", callback_data=f"chat:{post_id}")],
-        [InlineKeyboardButton(text="🚩 Пожаловаться", callback_data=f"report:{post_id}")],
-    ]
-    nav = []
-    if offset > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"posts:{offset - 1}"))
-    if offset + 1 < total:
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"posts:{offset + 1}"))
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton(text="🏠 В меню", callback_data="menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def post_actions_kb(post_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Начать чат", callback_data=f"chat:{post_id}")],
+            [InlineKeyboardButton(text="🚩 Пожаловаться", callback_data=f"report:{post_id}")],
+        ]
+    )
+
+
+def next_viewer_offset(user_id: int, total: int) -> int:
+    if total <= 0:
+        return 0
+    offset = VIEWER_OFFSET.get(user_id, 0) % total
+    VIEWER_OFFSET[user_id] = (offset + 1) % total
+    return offset
 
 
 def format_rating(post_id: int) -> str:
@@ -895,7 +899,7 @@ async def send_welcome(message: Message) -> None:
     await message.answer(
         "👋 <b>Добро пожаловать!</b>\n\n"
         "✏️ <b>Сделать свой пост</b> — только текст и смайлики\n"
-        "🔍 <b>Смотреть посты</b> — листайте анкеты и начинайте чат\n"
+        "🔍 <b>Смотреть посты</b> — каждое нажатие покажет новый пост\n"
         "💎 <b>Премиум</b> — пост в топе за приглашённых друзей\n\n"
         "💡 Сначала создайте пост, потом смотрите чужие и нажимайте «Начать чат»",
         reply_markup=main_menu_kb(),
@@ -1140,7 +1144,8 @@ async def view_posts(message: Message, state: FSMContext) -> None:
             reply_markup=chat_kb(),
         )
         return
-    total = count_posts_for_viewer(message.from_user.id)
+    user_id = message.from_user.id
+    total = count_posts_for_viewer(user_id)
     if total == 0:
         await message.answer(
             "🔍 <b>Пока пусто</b>\n\n"
@@ -1149,54 +1154,16 @@ async def view_posts(message: Message, state: FSMContext) -> None:
             reply_markup=main_menu_kb(),
         )
         return
-    await message.answer("🔍 Листайте посты кнопками ⬅️ ➡️", reply_markup=main_menu_kb())
-    await show_post_at_offset(message, 0)
-
-
-async def show_post_at_offset(message: Message, offset: int) -> None:
-    user_id = message.from_user.id
-    total = count_posts_for_viewer(user_id)
-    if offset < 0 or offset >= total:
-        await message.answer("📭 Больше постов нет.", reply_markup=main_menu_kb())
-        return
+    offset = next_viewer_offset(user_id, total)
     posts = list_posts_for_viewer(user_id, offset)
     if not posts:
         await message.answer("📭 Посты закончились.", reply_markup=main_menu_kb())
         return
     post = posts[0]
-    caption = format_post_caption(post)
-    kb = post_nav_kb(post["id"], offset, total)
-    await message.answer(caption, reply_markup=kb)
-
-
-@dp.callback_query(F.data == "menu")
-async def back_to_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-    await callback.message.answer("🏠 Главное меню", reply_markup=main_menu_kb())
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("posts:"))
-async def posts_nav(callback: CallbackQuery) -> None:
-    offset = int(callback.data.split(":")[1])
-    total = count_posts_for_viewer(callback.from_user.id)
-    if offset < 0 or offset >= total:
-        await callback.answer("Нет такого поста")
-        return
-    posts = list_posts_for_viewer(callback.from_user.id, offset)
-    if not posts:
-        await callback.answer("Пост не найден")
-        return
-    post = posts[0]
-    caption = format_post_caption(post)
-    kb = post_nav_kb(post["id"], offset, total)
-    await callback.message.delete()
-    await callback.message.answer(caption, reply_markup=kb)
-    await callback.answer()
+    await message.answer(
+        format_post_caption(post),
+        reply_markup=post_actions_kb(post["id"]),
+    )
 
 
 @dp.callback_query(F.data.startswith("report:"))
