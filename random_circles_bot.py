@@ -3,18 +3,60 @@ import logging
 import os
 import sqlite3
 from contextlib import closing
+from html import escape
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import BotCommand
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 
 DB_PATH = os.getenv("DB_PATH", "circles.db")
 BOT_TOKEN_FILE = os.getenv("BOT_TOKEN_FILE", "bot_token.txt")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "7704968798")
+ADMIN_IDS = {int(part.strip()) for part in ADMIN_IDS_RAW.split(",") if part.strip().isdigit()}
+
+BTN_CREATE_POST = "✏️ Сделать свой пост"
+BTN_VIEW_POSTS = "🔍 Смотреть посты"
+BTN_END_CHAT = "🚪 Прекратить диалог"
+BTN_MAIN_MENU = "🏠 В главное меню"
+BTN_BACK = "◀️ Назад"
+BTN_ACCEPT_RULES = "✅ Мне есть 18+ — принимаю правила"
+
+MAX_POST_LENGTH = 500
+ONLINE_THRESHOLD = timedelta(minutes=5)
+
+RULES_TEXT = (
+    "📜 <b>Правила RandomCircle</b>\n\n"
+    "🔞 <b>Только 18+.</b> Если вам нет 18 лет — покиньте бота.\n\n"
+    "📋 <b>Запрещено:</b>\n"
+    "• контент для несовершеннолетних, насилие, угрозы;\n"
+    "• спам, реклама, мошенничество;\n"
+    "• оскорбления, домогательства, разжигание ненависти;\n"
+    "• фото и файлы в постах — <b>только текст и смайлики</b>;\n"
+    "• нарушение <a href=\"https://telegram.org/tos\">правил Telegram</a>.\n\n"
+    "⚖️ За нарушения — блокировка без предупреждения.\n"
+    "🤝 Будьте вежливы. Не передавайте личные данные незнакомцам.\n\n"
+    "Нажимая кнопку ниже, вы подтверждаете возраст 18+ и согласие с правилами."
+)
+
+MENU_BUTTONS = frozenset({
+    BTN_CREATE_POST,
+    BTN_VIEW_POSTS,
+    BTN_END_CHAT,
+    BTN_MAIN_MENU,
+    BTN_BACK,
+})
 
 
 def read_secret(path: str) -> str:
@@ -25,11 +67,13 @@ def read_secret(path: str) -> str:
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", read_secret(BOT_TOKEN_FILE))
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = {int(part.strip()) for part in ADMIN_IDS_RAW.split(",") if part.strip().isdigit()}
 
-# Храним состояние "пользователь пишет комментарий к submission_id".
-PENDING_COMMENTS: dict[int, int] = {}
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class CreatePost(StatesGroup):
+    waiting_content = State()
 
 
 def now_iso() -> str:
@@ -38,1208 +82,1074 @@ def now_iso() -> str:
 
 def init_db() -> None:
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
+        conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                bonus_views INTEGER NOT NULL DEFAULT 0,
-                language TEXT NOT NULL DEFAULT 'ru',
                 created_at TEXT NOT NULL
-            )
-            """
-        )
-        user_cols = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(users)").fetchall()
-        }
-        if "language" not in user_cols:
-            conn.execute("ALTER TABLE users ADD COLUMN language TEXT NOT NULL DEFAULT 'ru'")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS submissions (
+            );
+
+            CREATE TABLE IF NOT EXISTS posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
-                file_id TEXT NOT NULL UNIQUE,
+                text TEXT NOT NULL,
+                photo_file_id TEXT,
                 created_at TEXT NOT NULL,
-                is_active INTEGER NOT NULL DEFAULT 1,
-                is_blocked INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS views (
-                user_id INTEGER NOT NULL,
-                submission_id INTEGER NOT NULL,
-                viewed_at TEXT NOT NULL,
-                PRIMARY KEY (user_id, submission_id)
-            )
-            """
-        )
-        conn.execute(
-            """
+                is_active INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS chats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_id INTEGER NOT NULL,
+                initiator_id INTEGER NOT NULL,
+                owner_id INTEGER NOT NULL,
+                initiator_post_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                ended_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS post_ratings (
+                post_id INTEGER NOT NULL,
+                rater_id INTEGER NOT NULL,
+                rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
+                chat_id INTEGER,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (post_id, rater_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS bans (
+                user_id INTEGER PRIMARY KEY,
+                banned_until TEXT,
+                reason TEXT,
+                banned_by INTEGER,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_id INTEGER NOT NULL,
                 reporter_id INTEGER NOT NULL,
-                submission_id INTEGER NOT NULL,
-                reason TEXT,
                 created_at TEXT NOT NULL,
-                UNIQUE (reporter_id, submission_id)
-            )
+                UNIQUE (post_id, reporter_id)
+            );
             """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reactions (
-                user_id INTEGER NOT NULL,
-                submission_id INTEGER NOT NULL,
-                reaction_type TEXT NOT NULL CHECK(reaction_type IN ('like', 'dislike')),
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (user_id, submission_id)
+        user_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "last_active_at" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN last_active_at TEXT")
+        if "last_chat_at" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN last_chat_at TEXT")
+        if "rules_accepted" not in user_cols:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN rules_accepted INTEGER NOT NULL DEFAULT 0"
             )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS comments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                submission_id INTEGER NOT NULL,
-                comment_text TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS referrals (
-                referred_user_id INTEGER PRIMARY KEY,
-                inviter_user_id INTEGER NOT NULL,
-                bonus_granted INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_bans (
-                user_id INTEGER PRIMARY KEY,
-                banned_until TEXT NOT NULL,
-                reason TEXT,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
         conn.commit()
 
 
 def ensure_user(user_id: int) -> None:
+    ts = now_iso()
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute(
             """
-            INSERT OR IGNORE INTO users (user_id, bonus_views, language, created_at)
-            VALUES (?, 0, 'ru', ?)
+            INSERT OR IGNORE INTO users (user_id, created_at, last_active_at, rules_accepted)
+            VALUES (?, ?, ?, 0)
             """,
-            (user_id, now_iso()),
+            (user_id, ts, ts),
         )
         conn.commit()
 
 
-def get_user_language(user_id: int) -> str:
+def touch_activity(user_id: int) -> None:
+    ensure_user(user_id)
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE users SET last_active_at = ? WHERE user_id = ?",
+            (now_iso(), user_id),
+        )
+        conn.commit()
+
+
+def touch_chat_activity(user_id: int) -> None:
+    ts = now_iso()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            """
+            UPDATE users SET last_chat_at = ?, last_active_at = ? WHERE user_id = ?
+            """,
+            (ts, ts, user_id),
+        )
+        conn.commit()
+
+
+def user_accepted_rules(user_id: int) -> bool:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         row = conn.execute(
-            "SELECT language FROM users WHERE user_id = ?",
+            "SELECT rules_accepted FROM users WHERE user_id = ?",
             (user_id,),
         ).fetchone()
-        lang = (row[0] if row else "ru") or "ru"
-        return "en" if lang == "en" else "ru"
+        return bool(row and row[0])
 
 
-def set_user_language(user_id: int, language: str) -> None:
-    language = "en" if language == "en" else "ru"
+def accept_rules(user_id: int) -> None:
+    ensure_user(user_id)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute(
-            "UPDATE users SET language = ? WHERE user_id = ?",
-            (language, user_id),
+            "UPDATE users SET rules_accepted = 1, last_active_at = ? WHERE user_id = ?",
+            (now_iso(), user_id),
         )
         conn.commit()
 
 
-def set_referral(referred_user_id: int, inviter_user_id: int) -> None:
-    if referred_user_id == inviter_user_id:
-        return
+def get_user_activity(user_id: int) -> dict:
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO referrals (
-                referred_user_id,
-                inviter_user_id,
-                bonus_granted,
-                created_at
-            )
-            VALUES (?, ?, 0, ?)
-            """,
-            (referred_user_id, inviter_user_id, now_iso()),
-        )
-        conn.commit()
-
-
-def grant_referral_bonus_if_needed(referred_user_id: int) -> Optional[int]:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
         row = conn.execute(
-            """
-            SELECT inviter_user_id, bonus_granted
-            FROM referrals
-            WHERE referred_user_id = ?
-            """,
-            (referred_user_id,),
+            "SELECT last_active_at, last_chat_at FROM users WHERE user_id = ?",
+            (user_id,),
         ).fetchone()
         if not row:
-            return None
-        inviter_user_id, bonus_granted = int(row[0]), int(row[1])
-        if bonus_granted:
-            return None
-
-        conn.execute(
-            "UPDATE users SET bonus_views = bonus_views + 50 WHERE user_id = ?",
-            (inviter_user_id,),
-        )
-        conn.execute(
-            "UPDATE referrals SET bonus_granted = 1 WHERE referred_user_id = ?",
-            (referred_user_id,),
-        )
-        conn.commit()
-        return inviter_user_id
+            return {"last_active_at": None, "last_chat_at": None}
+        return dict(row)
 
 
-def add_submission(user_id: int, file_id: str) -> bool:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        try:
-            conn.execute(
-                """
-                INSERT INTO submissions (user_id, file_id, created_at)
-                VALUES (?, ?, ?)
-                """,
-                (user_id, file_id, now_iso()),
-            )
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
+def parse_iso(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def get_user_active_submission(user_id: int) -> Optional[sqlite3.Row]:
+def format_time_remaining(iso_value: str) -> str:
+    dt = parse_iso(iso_value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    seconds = int((dt - datetime.now(timezone.utc)).total_seconds())
+    if seconds <= 0:
+        return "скоро"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} мин."
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} ч."
+    days = hours // 24
+    return f"{days} дн."
+
+
+def format_time_ago(iso_value: str | None) -> str | None:
+    if not iso_value:
+        return None
+    dt = parse_iso(iso_value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - dt
+    seconds = int(delta.total_seconds())
+    if seconds < 0:
+        return "только что"
+    if seconds < 60:
+        return "только что"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} мин. назад"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} ч. назад"
+    days = hours // 24
+    if days == 1:
+        return "вчера"
+    if days < 7:
+        return f"{days} дн. назад"
+    if days < 30:
+        weeks = days // 7
+        return f"{weeks} нед. назад"
+    months = days // 30
+    return f"{months} мес. назад"
+
+
+def format_author_status(user_id: int) -> str:
+    activity = get_user_activity(user_id)
+    lines = []
+
+    if get_active_chat(user_id):
+        lines.append("🔴 <b>Сейчас в диалоге</b>")
+
+    active_at = activity.get("last_active_at")
+    if active_at:
+        dt = parse_iso(active_at)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - dt <= ONLINE_THRESHOLD:
+            lines.append("🟢 <b>В боте:</b> сейчас онлайн")
+        else:
+            lines.append(f"🕐 <b>В боте:</b> {format_time_ago(active_at)}")
+    else:
+        lines.append("🕐 <b>В боте:</b> давно не заходил")
+
+    chat_at = activity.get("last_chat_at")
+    if chat_at:
+        lines.append(f"💬 <b>Последний чат:</b> {format_time_ago(chat_at)}")
+    else:
+        lines.append("💬 <b>Последний чат:</b> ещё не было")
+
+    lines.append("<i>ℹ️ По активности в боте (не статус Telegram)</i>")
+    return "\n".join(lines)
+
+
+def get_active_post(user_id: int) -> dict | None:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             """
-            SELECT id, user_id, file_id, created_at
-            FROM submissions
-            WHERE user_id = ?
-              AND is_active = 1
-              AND is_blocked = 0
+            SELECT id, user_id, text, photo_file_id
+            FROM posts
+            WHERE user_id = ? AND is_active = 1
             ORDER BY id DESC
             LIMIT 1
             """,
             (user_id,),
         ).fetchone()
-        return row
+        return dict(row) if row else None
 
 
-def delete_user_active_submission(user_id: int) -> bool:
+def create_post(user_id: int, text: str) -> int:
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        cur = conn.execute(
-            """
-            UPDATE submissions
-            SET is_active = 0
-            WHERE user_id = ?
-              AND is_active = 1
-              AND is_blocked = 0
-            """,
+        conn.execute(
+            "UPDATE posts SET is_active = 0 WHERE user_id = ? AND is_active = 1",
             (user_id,),
         )
-        conn.commit()
-        return cur.rowcount > 0
-
-
-def user_has_submissions(user_id: int) -> bool:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        row = conn.execute(
+        cur = conn.execute(
             """
-            SELECT 1
-            FROM submissions
-            WHERE user_id = ?
-              AND is_active = 1
-              AND is_blocked = 0
-            LIMIT 1
+            INSERT INTO posts (user_id, text, photo_file_id, created_at, is_active)
+            VALUES (?, ?, NULL, ?, 1)
             """,
-            (user_id,),
-        ).fetchone()
-        return row is not None
+            (user_id, text, now_iso()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
 
 
-def user_total_views(user_id: int) -> int:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM views WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        return int(row[0]) if row else 0
-
-
-def user_view_limit(user_id: int) -> int:
-    base_limit = 100 if user_has_submissions(user_id) else 10
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        row = conn.execute(
-            "SELECT bonus_views FROM users WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        bonus = int(row[0]) if row else 0
-    return base_limit + bonus
-
-
-def get_random_submission_for_user(user_id: int) -> Optional[sqlite3.Row]:
+def get_post(post_id: int) -> dict | None:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            """
-            SELECT s.id, s.user_id, s.file_id, s.created_at
-            FROM submissions s
-            WHERE s.is_active = 1
-              AND s.is_blocked = 0
-              AND s.user_id != ?
-              AND NOT EXISTS (
-                    SELECT 1
-                    FROM views v
-                    WHERE v.user_id = ?
-                      AND v.submission_id = s.id
-              )
-            ORDER BY RANDOM()
-            LIMIT 1
-            """,
-            (user_id, user_id),
+            "SELECT id, user_id, text, photo_file_id FROM posts WHERE id = ? AND is_active = 1",
+            (post_id,),
         ).fetchone()
-        return row
+        return dict(row) if row else None
 
 
-def get_submission(submission_id: int) -> Optional[sqlite3.Row]:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """
-            SELECT id, user_id, file_id, created_at
-            FROM submissions
-            WHERE id = ?
-            """,
-            (submission_id,),
-        ).fetchone()
-        return row
-
-
-def delete_submission(submission_id: int) -> bool:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        cur = conn.execute(
-            """
-            UPDATE submissions
-            SET is_active = 0, is_blocked = 1
-            WHERE id = ?
-            """,
-            (submission_id,),
-        )
-        conn.commit()
-        return cur.rowcount > 0
-
-
-def set_user_ban(user_id: int, hours: int, reason: str) -> None:
-    banned_until = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            """
-            INSERT INTO user_bans (user_id, banned_until, reason, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                banned_until = excluded.banned_until,
-                reason = excluded.reason,
-                updated_at = excluded.updated_at
-            """,
-            (user_id, banned_until, reason, now_iso()),
-        )
-        conn.commit()
-
-
-def get_ban_text_if_active(user_id: int) -> Optional[str]:
+def get_post_rating(post_id: int) -> tuple[float | None, int]:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         row = conn.execute(
-            "SELECT banned_until, reason FROM user_bans WHERE user_id = ?",
-            (user_id,),
+            "SELECT AVG(rating), COUNT(*) FROM post_ratings WHERE post_id = ?",
+            (post_id,),
         ).fetchone()
-        if not row:
-            return None
-
-        banned_until = datetime.fromisoformat(row[0])
-        now = datetime.now(timezone.utc)
-        if banned_until <= now:
-            conn.execute("DELETE FROM user_bans WHERE user_id = ?", (user_id,))
-            conn.commit()
-            return None
-
-        remaining = banned_until - now
-        hours = int(remaining.total_seconds() // 3600)
-        reason = row[1] or "moderation"
-        return f"Ты временно ограничен. Осталось ~{hours}ч. Причина: {reason}"
+        avg, count = row[0], row[1]
+        if not count:
+            return None, 0
+        return round(float(avg), 1), int(count)
 
 
-def mark_view(user_id: int, submission_id: int) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO views (user_id, submission_id, viewed_at)
-            VALUES (?, ?, ?)
-            """,
-            (user_id, submission_id, now_iso()),
-        )
-        conn.commit()
-
-
-def add_reaction(user_id: int, submission_id: int, reaction_type: str) -> bool:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        if reaction_type not in {"like", "dislike"}:
-            return False
-        conn.execute(
-            """
-            INSERT INTO reactions (user_id, submission_id, reaction_type, created_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(user_id, submission_id) DO UPDATE SET
-                reaction_type = excluded.reaction_type,
-                created_at = excluded.created_at
-            """,
-            (user_id, submission_id, reaction_type, now_iso()),
-        )
-        conn.commit()
-        return True
-
-
-def reaction_counts(submission_id: int) -> tuple[int, int]:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        likes_row = conn.execute(
-            "SELECT COUNT(*) FROM reactions WHERE submission_id = ? AND reaction_type = 'like'",
-            (submission_id,),
-        ).fetchone()
-        dislikes_row = conn.execute(
-            "SELECT COUNT(*) FROM reactions WHERE submission_id = ? AND reaction_type = 'dislike'",
-            (submission_id,),
-        ).fetchone()
-        likes = int(likes_row[0]) if likes_row else 0
-        dislikes = int(dislikes_row[0]) if dislikes_row else 0
-        return likes, dislikes
-
-
-def add_comment(user_id: int, submission_id: int, comment_text: str) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            """
-            INSERT INTO comments (user_id, submission_id, comment_text, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (user_id, submission_id, comment_text.strip(), now_iso()),
-        )
-        conn.commit()
-
-
-def get_comments_for_submission(submission_id: int, limit: int = 20) -> list[sqlite3.Row]:
+def list_posts_for_viewer(viewer_id: int, offset: int = 0) -> list[dict]:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            SELECT id, user_id, comment_text, created_at
-            FROM comments
-            WHERE submission_id = ?
-            ORDER BY id DESC
-            LIMIT ?
+            SELECT p.id, p.user_id, p.text, p.photo_file_id
+            FROM posts p
+            WHERE p.is_active = 1 AND p.user_id != ?
+            ORDER BY p.id DESC
+            LIMIT 1 OFFSET ?
             """,
-            (submission_id, limit),
+            (viewer_id, offset),
         ).fetchall()
-        return list(rows)
+        return [dict(r) for r in rows]
 
 
-def add_report(reporter_id: int, submission_id: int, reason: str = "manual") -> bool:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        try:
-            conn.execute(
-                """
-                INSERT INTO reports (reporter_id, submission_id, reason, created_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (reporter_id, submission_id, reason, now_iso()),
-            )
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
-
-
-def total_reports_for_submission(submission_id: int) -> int:
+def count_posts_for_viewer(viewer_id: int) -> int:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         row = conn.execute(
-            "SELECT COUNT(*) FROM reports WHERE submission_id = ?",
-            (submission_id,),
+            "SELECT COUNT(*) FROM posts WHERE is_active = 1 AND user_id != ?",
+            (viewer_id,),
         ).fetchone()
-        return int(row[0]) if row else 0
+        return int(row[0])
 
 
-def block_submission(submission_id: int) -> bool:
+def get_active_chat(user_id: int) -> dict | None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT id, post_id, initiator_id, owner_id, initiator_post_id, status
+            FROM chats
+            WHERE status = 'active'
+              AND (initiator_id = ? OR owner_id = ?)
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (user_id, user_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_chat(chat_id: int) -> dict | None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT id, post_id, initiator_id, owner_id, initiator_post_id, status
+            FROM chats WHERE id = ?
+            """,
+            (chat_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def start_chat(post_id: int, initiator_id: int) -> tuple[int | None, str | None]:
+    post = get_post(post_id)
+    if not post:
+        return None, "Пост не найден."
+    owner_id = post["user_id"]
+    if owner_id == initiator_id:
+        return None, "Нельзя начать чат со своим постом."
+
+    initiator_post = get_active_post(initiator_id)
+    if not initiator_post:
+        return None, "Сначала создайте свой пост — без него нельзя начать чат."
+
+    if get_active_chat(initiator_id):
+        return None, "Вы уже в диалоге. Завершите его кнопкой «Прекратить диалог»."
+    if get_active_chat(owner_id):
+        return None, "Автор поста сейчас занят в другом диалоге."
+
     with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.execute(
-            "UPDATE submissions SET is_blocked = 1 WHERE id = ?",
-            (submission_id,),
+            """
+            INSERT INTO chats (post_id, initiator_id, owner_id, initiator_post_id, status, created_at)
+            VALUES (?, ?, ?, ?, 'active', ?)
+            """,
+            (post_id, initiator_id, owner_id, initiator_post["id"], now_iso()),
+        )
+        conn.commit()
+        touch_chat_activity(initiator_id)
+        touch_chat_activity(owner_id)
+        return int(cur.lastrowid), None
+
+
+def end_chat(chat_id: int) -> dict | None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "UPDATE chats SET status = 'ended', ended_at = ? WHERE id = ? AND status = 'active'",
+            (now_iso(), chat_id),
+        )
+        conn.commit()
+    chat = get_chat(chat_id)
+    if chat:
+        touch_chat_activity(chat["initiator_id"])
+        touch_chat_activity(chat["owner_id"])
+    return chat
+
+
+def save_post_rating(post_id: int, rater_id: int, rating: int, chat_id: int) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            """
+            INSERT INTO post_ratings (post_id, rater_id, rating, chat_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(post_id, rater_id) DO UPDATE SET
+                rating = excluded.rating,
+                chat_id = excluded.chat_id,
+                created_at = excluded.created_at
+            """,
+            (post_id, rater_id, rating, chat_id, now_iso()),
+        )
+        conn.commit()
+
+
+def partner_id(chat: dict, user_id: int) -> int:
+    return chat["owner_id"] if user_id == chat["initiator_id"] else chat["initiator_id"]
+
+
+def rated_post_for_user(chat: dict, user_id: int) -> int:
+    """Пост собеседника, который оцениваем после диалога."""
+    if user_id == chat["initiator_id"]:
+        return chat["post_id"]
+    return chat["initiator_post_id"]
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def delete_post(post_id: int) -> bool:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute(
+            "UPDATE posts SET is_active = 0 WHERE id = ? AND is_active = 1",
+            (post_id,),
         )
         conn.commit()
         return cur.rowcount > 0
 
 
-def unviewed_count_for_user(user_id: int) -> int:
+def end_user_active_chats(user_id: int) -> None:
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        row = conn.execute(
+        conn.execute(
             """
-            SELECT COUNT(*)
-            FROM submissions s
-            WHERE s.is_active = 1
-              AND s.is_blocked = 0
-              AND s.user_id != ?
-              AND NOT EXISTS (
-                    SELECT 1
-                    FROM views v
-                    WHERE v.user_id = ?
-                      AND v.submission_id = s.id
-              )
+            UPDATE chats SET status = 'ended', ended_at = ?
+            WHERE status = 'active' AND (initiator_id = ? OR owner_id = ?)
             """,
-            (user_id, user_id),
-        ).fetchone()
-        return int(row[0]) if row else 0
-
-
-def next_keyboard(submission_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="⏭ Следующий", callback_data="next"),
-                InlineKeyboardButton(text="👍", callback_data=f"like:{submission_id}"),
-                InlineKeyboardButton(text="👎", callback_data=f"dislike:{submission_id}"),
-            ],
-            [
-                InlineKeyboardButton(text="💬 Комментарии", callback_data=f"comments:{submission_id}"),
-                InlineKeyboardButton(text="🚨 Пожаловаться", callback_data=f"report:{submission_id}"),
-            ],
-        ]
-    )
-
-
-def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎬 Смотреть кружки",
-                    callback_data="next",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="➕ Добавить свой кружок",
-                    callback_data="add_own",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎁 Пригласить друга (+50)",
-                    callback_data="invite",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📦 Мой кружок",
-                    callback_data="my_circle",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="👤 Профиль",
-                    callback_data="profile",
-                )
-            ],
-        ]
-    )
-
-
-def my_circle_keyboard(submission_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="💬 Мои комментарии", callback_data=f"my_comments:{submission_id}"),
-            ],
-            [
-                InlineKeyboardButton(text="🗑 Удалить мой кружок", callback_data="delete_my_circle"),
-            ],
-        ]
-    )
-
-
-def comments_keyboard(submission_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✍️ Написать комментарий",
-                    callback_data=f"comment:{submission_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад к кружкам",
-                    callback_data="next",
-                )
-            ],
-        ]
-    )
-
-
-def report_admin_keyboard(submission_id: int, owner_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="💬 Комментарии", callback_data=f"mod_comments:{submission_id}"),
-                InlineKeyboardButton(text="🚫 Блок кружок", callback_data=f"mod_block:{submission_id}"),
-            ],
-            [
-                InlineKeyboardButton(text="🗑 Удалить кружок", callback_data=f"mod_delete:{submission_id}"),
-            ],
-            [
-                InlineKeyboardButton(text="⛔ Бан 1д", callback_data=f"mod_ban:{owner_id}:1d"),
-                InlineKeyboardButton(text="⛔ Бан 7д", callback_data=f"mod_ban:{owner_id}:7d"),
-                InlineKeyboardButton(text="⛔ Бан 1г", callback_data=f"mod_ban:{owner_id}:1y"),
-            ],
-        ]
-    )
-
-
-def quick_nav_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🏠 Меню", callback_data="menu"),
-                InlineKeyboardButton(text="🎬 Смотреть", callback_data="next"),
-            ],
-            [
-                InlineKeyboardButton(text="📦 Мой кружок", callback_data="my_circle"),
-            ],
-        ]
-    )
-
-
-def profile_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🌐 Язык / Language", callback_data="lang_menu"),
-            ],
-            [
-                InlineKeyboardButton(text="🏠 Меню", callback_data="menu"),
-            ],
-        ]
-    )
-
-
-def language_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🇷🇺 Русский", callback_data="set_lang:ru"),
-                InlineKeyboardButton(text="🇬🇧 English", callback_data="set_lang:en"),
-            ],
-            [
-                InlineKeyboardButton(text="⬅️ Назад в профиль", callback_data="profile"),
-            ],
-        ]
-    )
-
-
-def referral_link(bot_username: Optional[str], user_id: int) -> str:
-    if bot_username:
-        return f"https://t.me/{bot_username}?start=ref_{user_id}"
-    return f"/start ref_{user_id}"
-
-
-def format_limits_text(user_id: int) -> str:
-    limit = user_view_limit(user_id)
-    used = user_total_views(user_id)
-    remaining = max(0, limit - used)
-    return (
-        f"Лимит просмотров: {limit}\n"
-        f"Использовано: {used}\n"
-        f"Осталось: {remaining}"
-    )
-
-
-async def send_admin_report(bot: Bot, submission_id: int, reporter_id: int, reports_count: int) -> None:
-    if ADMIN_CHAT_ID == 0:
-        return
-    submission = get_submission(submission_id)
-    if not submission:
-        return
-
-    await bot.send_video_note(chat_id=ADMIN_CHAT_ID, video_note=submission["file_id"])
-    await bot.send_message(
-        ADMIN_CHAT_ID,
-        (
-            "Новый репорт\n"
-            f"submission_id: {submission_id}\n"
-            f"owner_id: {submission['user_id']}\n"
-            f"reporter_id: {reporter_id}\n"
-            f"reports_total: {reports_count}"
-        ),
-        reply_markup=report_admin_keyboard(submission_id, submission["user_id"]),
-    )
-
-
-async def show_random_circle(target: Message | CallbackQuery, user_id: int) -> None:
-    ban_text = get_ban_text_if_active(user_id)
-    if ban_text:
-        if isinstance(target, CallbackQuery):
-            await target.message.answer(ban_text, reply_markup=quick_nav_keyboard())
-        else:
-            await target.answer(ban_text, reply_markup=quick_nav_keyboard())
-        return
-
-    ensure_user(user_id)
-    limit = user_view_limit(user_id)
-    used = user_total_views(user_id)
-    remaining = limit - used
-
-    if remaining <= 0:
-        text = (
-            "Ты исчерпал лимит просмотров.\n"
-            "Без своего кружка доступно 10 просмотров.\n"
-            "После отправки своего кружка станет 100.\n"
-            "За каждого приглашенного друга +50.\n\n"
-            f"{format_limits_text(user_id)}"
+            (now_iso(), user_id, user_id),
         )
-        if isinstance(target, CallbackQuery):
-            await target.message.answer(text, reply_markup=main_keyboard())
-        else:
-            await target.answer(text, reply_markup=main_keyboard())
-        return
+        conn.commit()
 
-    submission = get_random_submission_for_user(user_id)
-    if not submission:
-        text = (
-            "Пока нет новых кружков для тебя.\n"
-            "Отправь свой кружок, и попробуй снова позже."
-        )
-        if isinstance(target, CallbackQuery):
-            await target.message.answer(text, reply_markup=main_keyboard())
-        else:
-            await target.answer(text, reply_markup=main_keyboard())
-        return
 
-    mark_view(user_id, submission["id"])
-    likes, dislikes = reaction_counts(submission["id"])
-    caption = (
-        "Случайный кружок от другого пользователя\n"
-        f"ID: {submission['id']}\n"
-        f"Лайки: {likes} | Дизлайки: {dislikes}\n"
-        f"Просмотров осталось: {max(0, remaining - 1)}\n\n"
-        "Под кружком можно оставить 💬 комментарий или отправить 🚨 жалобу."
-    )
-    if isinstance(target, CallbackQuery):
-        await target.message.answer_video_note(submission["file_id"])
-        await target.message.answer(caption, reply_markup=next_keyboard(submission["id"]))
+def ban_user(user_id: int, hours: int, reason: str, admin_id: int) -> None:
+    if hours <= 0:
+        banned_until = None
     else:
-        await target.answer_video_note(submission["file_id"])
-        await target.answer(caption, reply_markup=next_keyboard(submission["id"]))
+        banned_until = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            """
+            INSERT INTO bans (user_id, banned_until, reason, banned_by, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                banned_until = excluded.banned_until,
+                reason = excluded.reason,
+                banned_by = excluded.banned_by,
+                created_at = excluded.created_at
+            """,
+            (user_id, banned_until, reason, admin_id, now_iso()),
+        )
+        conn.commit()
+    end_user_active_chats(user_id)
 
 
-dp = Dispatcher()
+def unban_user(user_id: int) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("DELETE FROM bans WHERE user_id = ?", (user_id,))
+        conn.commit()
 
 
-@dp.message(CommandStart(deep_link=True))
-async def start_with_ref(message: Message, command: CommandObject) -> None:
-    ensure_user(message.from_user.id)
-    args = command.args or ""
-    if args.startswith("ref_") and args[4:].isdigit():
-        inviter_id = int(args[4:])
-        set_referral(message.from_user.id, inviter_id)
-    await start_handler(message)
+def get_ban_info(user_id: int) -> dict | None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT banned_until, reason FROM bans WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return None
+        banned_until = row["banned_until"]
+        if banned_until is None:
+            return {"permanent": True, "reason": row["reason"]}
+        until_dt = parse_iso(banned_until)
+        if until_dt.tzinfo is None:
+            until_dt = until_dt.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) >= until_dt:
+            unban_user(user_id)
+            return None
+        return {
+            "permanent": False,
+            "until": banned_until,
+            "reason": row["reason"],
+        }
+
+
+def is_user_banned(user_id: int) -> bool:
+    return get_ban_info(user_id) is not None
+
+
+def ban_message_text(user_id: int) -> str:
+    info = get_ban_info(user_id)
+    if not info:
+        return ""
+    reason = escape(info.get("reason") or "нарушение правил")
+    if info.get("permanent"):
+        return f"🚫 <b>Вы заблокированы навсегда.</b>\n\nПричина: {reason}"
+    remaining = format_time_remaining(info["until"])
+    return (
+        f"🚫 <b>Вы временно заблокированы.</b>\n\n"
+        f"Причина: {reason}\n"
+        f"⏱ Осталось: ~{remaining}"
+    )
+
+
+def save_report(post_id: int, reporter_id: int) -> bool:
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            conn.execute(
+                "INSERT INTO reports (post_id, reporter_id, created_at) VALUES (?, ?, ?)",
+                (post_id, reporter_id, now_iso()),
+            )
+            conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def admin_moderation_kb(post_id: int, author_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Удалить пост", callback_data=f"adm:del:{post_id}")],
+            [
+                InlineKeyboardButton(text="⏱ Бан 1 д", callback_data=f"adm:ban:{author_id}:24"),
+                InlineKeyboardButton(text="⏱ Бан 7 д", callback_data=f"adm:ban:{author_id}:168"),
+            ],
+            [InlineKeyboardButton(text="🔒 Бан навсегда", callback_data=f"adm:ban:{author_id}:0")],
+            [InlineKeyboardButton(text="✅ Пропустить", callback_data=f"adm:skip:{post_id}")],
+        ]
+    )
+
+
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_CREATE_POST)],
+            [KeyboardButton(text=BTN_VIEW_POSTS)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def back_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=BTN_BACK)]],
+        resize_keyboard=True,
+    )
+
+
+def chat_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_END_CHAT)],
+            [KeyboardButton(text=BTN_MAIN_MENU)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def rating_kb(chat_id: int) -> InlineKeyboardMarkup:
+    stars = ["⭐", "⭐⭐", "⭐⭐⭐", "⭐⭐⭐⭐", "⭐⭐⭐⭐⭐"]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"{n} {stars[n - 1]}",
+                    callback_data=f"rate:{chat_id}:{n}",
+                )
+                for n in range(1, 6)
+            ]
+        ]
+    )
+
+
+def post_nav_kb(post_id: int, offset: int, total: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="💬 Начать чат", callback_data=f"chat:{post_id}")],
+        [InlineKeyboardButton(text="🚩 Пожаловаться", callback_data=f"report:{post_id}")],
+    ]
+    nav = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"posts:{offset - 1}"))
+    if offset + 1 < total:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"posts:{offset + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🏠 В меню", callback_data="menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def format_rating(post_id: int) -> str:
+    avg, count = get_post_rating(post_id)
+    if avg is None:
+        return "⭐ Оценка: пока нет отзывов"
+    word = "отзыв" if count % 10 == 1 and count % 100 != 11 else "отзывов"
+    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        word = "отзыва"
+    return f"⭐ Оценка: {avg}/5 · {count} {word}"
+
+
+def format_post_caption(post: dict, header: str = "") -> str:
+    title = header or f"📄 Пост №{post['id']}"
+    lines = [f"<b>{escape(title)}</b>"]
+    lines.append(f"📝 {escape(post['text'])}")
+    lines.append(format_rating(post["id"]))
+    lines.append(format_author_status(post["user_id"]))
+    return "\n\n".join(lines)
+
+
+async def send_post(bot: Bot, chat_id: int, post: dict, header: str = "") -> None:
+    await bot.send_message(chat_id, format_post_caption(post, header=header))
+
+
+def rules_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=BTN_ACCEPT_RULES)]],
+        resize_keyboard=True,
+    )
+
+
+async def send_welcome(message: Message) -> None:
+    await message.answer(
+        "👋 <b>Добро пожаловать!</b>\n\n"
+        "✏️ <b>Сделать свой пост</b> — только текст и смайлики\n"
+        "🔍 <b>Смотреть посты</b> — листайте анкеты и начинайте чат\n\n"
+        "💡 Сначала создайте пост, потом смотрите чужие и нажимайте «Начать чат»",
+        reply_markup=main_menu_kb(),
+    )
+
+
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+
+@dp.update.outer_middleware()
+async def track_activity(handler, event, data):
+    user = None
+    bot = data.get("bot")
+    if hasattr(event, "from_user") and event.from_user:
+        user = event.from_user
+    elif hasattr(event, "message") and event.message and event.message.from_user:
+        user = event.message.from_user
+
+    if user and not is_admin(user.id) and is_user_banned(user.id):
+        text = ban_message_text(user.id)
+        if isinstance(event, Message) and bot:
+            await event.answer(text, parse_mode="HTML")
+        elif hasattr(event, "answer"):
+            await event.answer("Вы заблокированы", show_alert=True)
+        return None
+
+    if user:
+        touch_activity(user.id)
+    return await handler(event, data)
 
 
 @dp.message(CommandStart())
-async def start_handler(message: Message) -> None:
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
     ensure_user(message.from_user.id)
-    bot_info = await message.bot.get_me()
-    invite = referral_link(bot_info.username, message.from_user.id)
-    await message.answer(
-        "✨ Добро пожаловать в Random Circle!\n\n"
-        "📌 Как это работает:\n"
-        "• Без своего кружка: 10 просмотров\n"
-        "• После своего кружка: 100 просмотров\n"
-        "• За каждого приглашенного: +50 просмотров\n\n"
-        "⚙️ Команды:\n"
-        "/random — случайный кружок\n"
-        "/stats — твой лимит и статистика\n"
-        "/invite — твоя реферальная ссылка\n\n"
-        f"🔗 Твоя ссылка: {invite}",
-        reply_markup=main_keyboard(),
-    )
-
-
-@dp.message(Command("menu"))
-async def menu_command(message: Message) -> None:
-    await message.answer("Главное меню:", reply_markup=main_keyboard())
-
-
-@dp.message(Command("profile"))
-async def profile_command(message: Message) -> None:
-    await profile_message(message, message.from_user.id)
-
-
-@dp.message(Command("my"))
-async def my_command(message: Message) -> None:
-    await my_circle_message(message, message.from_user.id)
-
-
-@dp.message(Command("invite"))
-async def invite_command(message: Message) -> None:
-    bot_info = await message.bot.get_me()
-    invite = referral_link(bot_info.username, message.from_user.id)
-    await message.answer(
-        "Приглашай друзей по ссылке.\n"
-        "Когда приглашенный отправит свой первый кружок, ты получишь +50 просмотров.\n"
-        f"{invite}"
-    )
-
-
-@dp.callback_query(F.data == "invite")
-async def invite_callback(callback: CallbackQuery) -> None:
-    bot_info = await callback.bot.get_me()
-    invite = referral_link(bot_info.username, callback.from_user.id)
-    await callback.answer()
-    await callback.message.answer(
-        "🎁 Приглашай друзей этой ссылкой:\n"
-        f"{invite}\n\n"
-        "После первого кружка друга тебе начислится +50 просмотров."
-    )
-
-
-@dp.callback_query(F.data == "add_own")
-async def add_own_callback(callback: CallbackQuery) -> None:
-    await callback.answer()
-    current = get_user_active_submission(callback.from_user.id)
-    if current:
-        await callback.message.answer(
-            "У тебя уже есть активный кружок.\n"
-            "Открой раздел «📦 Мой кружок», удали его и отправь новый.",
-            reply_markup=quick_nav_keyboard(),
-        )
+    if not user_accepted_rules(message.from_user.id):
+        await message.answer(RULES_TEXT, reply_markup=rules_kb())
         return
-    await callback.message.answer("➕ Отправь сюда кружок (video note), и я добавлю его в ленту.")
+    await send_welcome(message)
 
 
-@dp.callback_query(F.data == "my_circle")
-async def my_circle_callback(callback: CallbackQuery) -> None:
-    await callback.answer()
-    await my_circle_message(callback.message, callback.from_user.id)
+@dp.message(F.text == BTN_ACCEPT_RULES)
+async def accept_rules_handler(message: Message, state: FSMContext) -> None:
+    accept_rules(message.from_user.id)
+    await state.clear()
+    await message.answer("✅ Спасибо! Правила приняты.", reply_markup=main_menu_kb())
+    await send_welcome(message)
 
 
-async def my_circle_message(message: Message, user_id: int) -> None:
-    submission = get_user_active_submission(user_id)
-    if not submission:
+async def require_rules(message: Message) -> bool:
+    if user_accepted_rules(message.from_user.id):
+        return True
+    await message.answer(RULES_TEXT, reply_markup=rules_kb())
+    return False
+
+
+@dp.message(F.text == BTN_CREATE_POST)
+async def create_post_start(message: Message, state: FSMContext) -> None:
+    if not await require_rules(message):
+        return
+    if get_active_chat(message.from_user.id):
         await message.answer(
-            "У тебя пока нет активного кружка.\n"
-            "Нажми «➕ Добавить свой кружок».",
-            reply_markup=quick_nav_keyboard(),
+            "⚠️ Сначала завершите текущий диалог.",
+            reply_markup=chat_kb(),
         )
         return
-    likes, dislikes = reaction_counts(submission["id"])
-    await message.answer_video_note(submission["file_id"])
+    await state.set_state(CreatePost.waiting_content)
     await message.answer(
-        (
-            f"Твой кружок (ID: {submission['id']})\n"
-            f"Реакции: 👍 {likes} | 👎 {dislikes}\n"
-            "Открой комментарии или удали кружок, чтобы загрузить новый."
-        ),
-        reply_markup=my_circle_keyboard(submission["id"]),
+        "✏️ <b>Создание поста</b>\n\n"
+        "📤 Отправьте <b>только текст</b> (можно со смайликами).\n"
+        "🚫 Фото, видео, стикеры и файлы — нельзя.\n\n"
+        f"📏 До {MAX_POST_LENGTH} символов.\n\n"
+        "↩️ Передумали? Нажмите «Назад».",
+        reply_markup=back_kb(),
     )
 
 
-@dp.callback_query(F.data.startswith("my_comments:"))
-async def my_comments_callback(callback: CallbackQuery) -> None:
-    await callback.answer()
-    _, raw_id = callback.data.split(":", maxsplit=1)
-    submission_id = int(raw_id)
-    submission = get_submission(submission_id)
-    if not submission or submission["user_id"] != callback.from_user.id:
-        await callback.message.answer("Это не твой кружок.", reply_markup=quick_nav_keyboard())
-        return
-
-    comments = get_comments_for_submission(submission_id, limit=15)
-    if not comments:
-        await callback.message.answer("Комментариев пока нет.", reply_markup=quick_nav_keyboard())
-        return
-
-    lines = ["Последние комментарии к твоему кружку:"]
-    for idx, row in enumerate(comments, start=1):
-        text = (row["comment_text"] or "").replace("\n", " ").strip()
-        if len(text) > 140:
-            text = text[:140] + "..."
-        lines.append(f"{idx}) от {row['user_id']}: {text}")
-    await callback.message.answer("\n".join(lines), reply_markup=quick_nav_keyboard())
-
-
-@dp.callback_query(F.data == "delete_my_circle")
-async def delete_my_circle_callback(callback: CallbackQuery) -> None:
-    await callback.answer()
-    deleted = delete_user_active_submission(callback.from_user.id)
-    if deleted:
-        await callback.message.answer(
-            "Твой текущий кружок удален из ленты.\n"
-            "Теперь можешь отправить новый.",
-            reply_markup=quick_nav_keyboard(),
-        )
-    else:
-        await callback.message.answer("У тебя нет активного кружка.", reply_markup=quick_nav_keyboard())
-
-
-@dp.message(Command("random"))
-async def random_command(message: Message) -> None:
-    await show_random_circle(message, message.from_user.id)
-
-
-@dp.message(Command("stats"))
-async def stats_command(message: Message) -> None:
-    ensure_user(message.from_user.id)
-    count = unviewed_count_for_user(message.from_user.id)
+@dp.message(CreatePost.waiting_content, F.text == BTN_BACK)
+async def create_post_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
     await message.answer(
-        (
-            f"Новых кружков в ленте: {count}\n{format_limits_text(message.from_user.id)}\n\n"
-            "Команды: /menu /random /my /stats /invite"
-        ),
-        reply_markup=quick_nav_keyboard(),
+        "↩️ Создание поста отменено.",
+        reply_markup=main_menu_kb(),
     )
 
 
-@dp.message(F.video_note)
-async def video_note_handler(message: Message) -> None:
+@dp.message(CreatePost.waiting_content, F.text == BTN_MAIN_MENU)
+async def create_post_to_menu(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("🏠 Главное меню", reply_markup=main_menu_kb())
+
+
+@dp.message(
+    CreatePost.waiting_content,
+    F.photo | F.video | F.voice | F.audio | F.document | F.sticker | F.animation,
+)
+async def create_post_no_media(message: Message) -> None:
+    await message.answer(
+        "🚫 В пост можно отправить <b>только текст</b>.\n"
+        "Фото, видео, стикеры и файлы не принимаются.",
+    )
+
+
+@dp.message(CreatePost.waiting_content, F.text)
+async def create_post_text(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()
+    if not text:
+        await message.answer("⚠️ Текст не может быть пустым.")
+        return
+    if len(text) > MAX_POST_LENGTH:
+        await message.answer(
+            f"⚠️ Слишком длинный текст. Максимум {MAX_POST_LENGTH} символов "
+            f"(у вас {len(text)})."
+        )
+        return
+    post_id = create_post(message.from_user.id, text)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>Пост опубликован!</b> №{post_id}\n\n📝 {escape(text)}",
+        reply_markup=main_menu_kb(),
+    )
+
+
+@dp.message(CreatePost.waiting_content)
+async def create_post_invalid(message: Message) -> None:
+    await message.answer(
+        "📝 Отправьте текст поста (только буквы и смайлики).\n"
+        "Или нажмите «◀️ Назад», чтобы вернуться в меню.",
+    )
+
+
+@dp.message(F.text == BTN_VIEW_POSTS)
+async def view_posts(message: Message, state: FSMContext) -> None:
+    if not await require_rules(message):
+        return
+    await state.clear()
+    if get_active_chat(message.from_user.id):
+        await message.answer(
+            "💬 Вы в диалоге. Завершите его, чтобы смотреть посты.",
+            reply_markup=chat_kb(),
+        )
+        return
+    total = count_posts_for_viewer(message.from_user.id)
+    if total == 0:
+        await message.answer(
+            "🔍 <b>Пока пусто</b>\n\n"
+            "Нет постов других пользователей.\n"
+            "Попросите друзей зайти в бота и создать пост ✏️",
+            reply_markup=main_menu_kb(),
+        )
+        return
+    await message.answer("🔍 Листайте посты кнопками ⬅️ ➡️", reply_markup=main_menu_kb())
+    await show_post_at_offset(message, 0)
+
+
+async def show_post_at_offset(message: Message, offset: int) -> None:
     user_id = message.from_user.id
-    ban_text = get_ban_text_if_active(user_id)
-    if ban_text:
-        await message.answer(ban_text, reply_markup=quick_nav_keyboard())
+    total = count_posts_for_viewer(user_id)
+    if offset < 0 or offset >= total:
+        await message.answer("📭 Больше постов нет.", reply_markup=main_menu_kb())
         return
-
-    ensure_user(user_id)
-    existing = get_user_active_submission(user_id)
-    if existing:
-        await message.answer(
-            "У тебя уже есть активный кружок.\n"
-            "Сначала удали его в разделе «📦 Мой кружок», потом отправь новый.",
-            reply_markup=quick_nav_keyboard(),
-        )
+    posts = list_posts_for_viewer(user_id, offset)
+    if not posts:
+        await message.answer("📭 Посты закончились.", reply_markup=main_menu_kb())
         return
-
-    file_id = message.video_note.file_id
-    created = add_submission(user_id, file_id)
-    if created:
-        inviter = grant_referral_bonus_if_needed(user_id)
-        if inviter and ADMIN_CHAT_ID:
-            await message.bot.send_message(
-                ADMIN_CHAT_ID,
-                f"Реферальный бонус выдан: inviter_id={inviter}, invited_id={user_id}, +50",
-            )
-        await message.answer(
-            "Кружок добавлен. Спасибо!\n"
-            "Теперь твой базовый лимит просмотров: 100.",
-            reply_markup=main_keyboard(),
-        )
-    else:
-        await message.answer("Этот кружок уже есть в базе.")
-
-
-@dp.message(F.text)
-async def comment_input_handler(message: Message) -> None:
-    ban_text = get_ban_text_if_active(message.from_user.id)
-    if ban_text:
-        await message.answer(ban_text, reply_markup=quick_nav_keyboard())
-        return
-
-    submission_id = PENDING_COMMENTS.pop(message.from_user.id, None)
-    if not submission_id:
-        return
-    comment_text = (message.text or "").strip()
-    if not comment_text:
-        await message.answer("Пустой комментарий не сохранен.")
-        return
-    if len(comment_text) > 500:
-        await message.answer("Комментарий слишком длинный (максимум 500 символов).")
-        return
-    add_comment(message.from_user.id, submission_id, comment_text)
-    await message.answer("Комментарий сохранен.")
-    submission = get_submission(submission_id)
-    if submission and submission["user_id"] != message.from_user.id:
-        try:
-            await message.bot.send_message(
-                submission["user_id"],
-                (
-                    "💬 Новый комментарий к твоему кружку:\n"
-                    f"{comment_text}\n\n"
-                    "Открой «📦 Мой кружок», чтобы посмотреть все комментарии."
-                ),
-                reply_markup=quick_nav_keyboard(),
-            )
-        except Exception:
-            # Владелец мог заблокировать бота.
-            pass
-
-
-@dp.callback_query(F.data == "next")
-async def next_callback(callback: CallbackQuery) -> None:
-    await callback.answer()
-    await show_random_circle(callback, callback.from_user.id)
+    post = posts[0]
+    caption = format_post_caption(post)
+    kb = post_nav_kb(post["id"], offset, total)
+    await message.answer(caption, reply_markup=kb)
 
 
 @dp.callback_query(F.data == "menu")
-async def menu_callback(callback: CallbackQuery) -> None:
-    await callback.answer()
-    await callback.message.answer("Главное меню:", reply_markup=main_keyboard())
-
-
-@dp.callback_query(F.data == "profile")
-async def profile_callback(callback: CallbackQuery) -> None:
-    await callback.answer()
-    await profile_message(callback.message, callback.from_user.id)
-
-
-@dp.callback_query(F.data == "lang_menu")
-async def lang_menu_callback(callback: CallbackQuery) -> None:
-    await callback.answer()
-    await callback.message.answer(
-        "Выбери язык интерфейса / Choose interface language:",
-        reply_markup=language_keyboard(),
-    )
-
-
-@dp.callback_query(F.data.startswith("set_lang:"))
-async def set_lang_callback(callback: CallbackQuery) -> None:
-    ensure_user(callback.from_user.id)
-    _, lang = callback.data.split(":", maxsplit=1)
-    set_user_language(callback.from_user.id, lang)
-    await callback.answer("Language updated" if lang == "en" else "Язык обновлен")
-    await profile_message(callback.message, callback.from_user.id)
-
-
-async def profile_message(message: Message, user_id: int) -> None:
-    ensure_user(user_id)
-    lang = get_user_language(user_id)
-    limit = user_view_limit(user_id)
-    used = user_total_views(user_id)
-    remaining = max(0, limit - used)
-    if lang == "en":
-        text = (
-            "👤 Profile\n"
-            f"Language: English\n"
-            f"Views limit: {limit}\n"
-            f"Used: {used}\n"
-            f"Remaining: {remaining}"
-        )
-    else:
-        text = (
-            "👤 Профиль\n"
-            f"Язык: Русский\n"
-            f"Лимит просмотров: {limit}\n"
-            f"Использовано: {used}\n"
-            f"Осталось: {remaining}"
-        )
-    await message.answer(text, reply_markup=profile_keyboard())
-
-
-def is_admin_user(user_id: int) -> bool:
-    if ADMIN_IDS:
-        return user_id in ADMIN_IDS
-    return True
-
-
-@dp.callback_query(F.data.startswith("mod_comments:"))
-async def mod_comments_callback(callback: CallbackQuery) -> None:
-    if not is_admin_user(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-    _, raw_id = callback.data.split(":", maxsplit=1)
-    submission_id = int(raw_id)
-    comments = get_comments_for_submission(submission_id, limit=20)
-    if not comments:
-        await callback.answer("Комментариев нет")
-        return
-    lines = [f"Комментарии по submission {submission_id}:"]
-    for row in comments:
-        text = (row["comment_text"] or "").replace("\n", " ").strip()
-        if len(text) > 120:
-            text = text[:120] + "..."
-        lines.append(f"- {row['user_id']}: {text}")
-    await callback.answer()
-    await callback.message.answer("\n".join(lines))
-
-
-@dp.callback_query(F.data.startswith("mod_block:"))
-async def mod_block_callback(callback: CallbackQuery) -> None:
-    if not is_admin_user(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-    _, raw_id = callback.data.split(":", maxsplit=1)
-    submission_id = int(raw_id)
-    ok = block_submission(submission_id)
-    await callback.answer("Готово" if ok else "Не найдено")
-
-
-@dp.callback_query(F.data.startswith("mod_delete:"))
-async def mod_delete_callback(callback: CallbackQuery) -> None:
-    if not is_admin_user(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-    _, raw_id = callback.data.split(":", maxsplit=1)
-    submission_id = int(raw_id)
-    ok = delete_submission(submission_id)
-    await callback.answer("Удалено" if ok else "Не найдено")
-
-
-@dp.callback_query(F.data.startswith("mod_ban:"))
-async def mod_ban_callback(callback: CallbackQuery) -> None:
-    if not is_admin_user(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-    _, raw_user, period = callback.data.split(":", maxsplit=2)
-    target_user_id = int(raw_user)
-    hours_map = {"1d": 24, "7d": 24 * 7, "1y": 24 * 365}
-    hours = hours_map.get(period)
-    if not hours:
-        await callback.answer("Неверный период", show_alert=True)
-        return
-    set_user_ban(target_user_id, hours=hours, reason=f"admin:{period}")
-    await callback.answer(f"Пользователь забанен: {period}")
+async def back_to_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     try:
-        await callback.bot.send_message(
-            target_user_id,
-            f"Тебе выдан бан на {period}.",
-        )
+        await callback.message.delete()
     except Exception:
         pass
-
-
-@dp.callback_query(F.data.startswith("like:"))
-async def like_callback(callback: CallbackQuery) -> None:
-    _, raw_id = callback.data.split(":", maxsplit=1)
-    submission_id = int(raw_id)
-    add_reaction(callback.from_user.id, submission_id, "like")
-    likes, dislikes = reaction_counts(submission_id)
-    await callback.answer(f"Лайк учтен ({likes}/{dislikes})")
-
-
-@dp.callback_query(F.data.startswith("dislike:"))
-async def dislike_callback(callback: CallbackQuery) -> None:
-    _, raw_id = callback.data.split(":", maxsplit=1)
-    submission_id = int(raw_id)
-    add_reaction(callback.from_user.id, submission_id, "dislike")
-    likes, dislikes = reaction_counts(submission_id)
-    await callback.answer(f"Дизлайк учтен ({likes}/{dislikes})")
-
-
-@dp.callback_query(F.data.startswith("comment:"))
-async def comment_callback(callback: CallbackQuery) -> None:
-    _, raw_id = callback.data.split(":", maxsplit=1)
-    submission_id = int(raw_id)
-    PENDING_COMMENTS[callback.from_user.id] = submission_id
-    await callback.answer("Жду текст комментария")
-    await callback.message.answer("Напиши текст комментария следующим сообщением.")
-
-
-@dp.callback_query(F.data.startswith("comments:"))
-async def comments_list_callback(callback: CallbackQuery) -> None:
+    await callback.message.answer("🏠 Главное меню", reply_markup=main_menu_kb())
     await callback.answer()
-    _, raw_id = callback.data.split(":", maxsplit=1)
-    submission_id = int(raw_id)
 
-    submission = get_submission(submission_id)
-    if not submission:
-        await callback.message.answer("Кружок не найден.")
+
+@dp.callback_query(F.data.startswith("posts:"))
+async def posts_nav(callback: CallbackQuery) -> None:
+    offset = int(callback.data.split(":")[1])
+    total = count_posts_for_viewer(callback.from_user.id)
+    if offset < 0 or offset >= total:
+        await callback.answer("Нет такого поста")
         return
-
-    comments = get_comments_for_submission(submission_id, limit=15)
-    if not comments:
-        text = "Комментариев пока нет. Будь первым 👇"
-    else:
-        lines = ["Комментарии к кружку:"]
-        for idx, row in enumerate(comments, start=1):
-            comment = (row["comment_text"] or "").replace("\n", " ").strip()
-            if len(comment) > 140:
-                comment = comment[:140] + "..."
-            lines.append(f"{idx}) {comment}")
-        text = "\n".join(lines)
-
-    await callback.message.answer(text, reply_markup=comments_keyboard(submission_id))
+    posts = list_posts_for_viewer(callback.from_user.id, offset)
+    if not posts:
+        await callback.answer("Пост не найден")
+        return
+    post = posts[0]
+    caption = format_post_caption(post)
+    kb = post_nav_kb(post["id"], offset, total)
+    await callback.message.delete()
+    await callback.message.answer(caption, reply_markup=kb)
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("report:"))
-async def report_callback(callback: CallbackQuery) -> None:
-    await callback.answer("Жалоба принята")
-    _, raw_id = callback.data.split(":", maxsplit=1)
-    submission_id = int(raw_id)
-    reported = add_report(callback.from_user.id, submission_id)
-    total_reports = total_reports_for_submission(submission_id)
-
-    if total_reports >= 3:
-        block_submission(submission_id)
-
-    if reported:
-        await send_admin_report(callback.bot, submission_id, callback.from_user.id, total_reports)
-        await callback.message.answer("Спасибо! Репорт отправлен админу.")
-    else:
-        await callback.message.answer("Ты уже жаловался на этот кружок.")
-
-
-@dp.message(Command("block"))
-async def block_command(message: Message) -> None:
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Недостаточно прав.")
+async def report_post(callback: CallbackQuery, bot: Bot) -> None:
+    post_id = int(callback.data.split(":")[1])
+    reporter_id = callback.from_user.id
+    post = get_post(post_id)
+    if not post:
+        await callback.answer("Пост уже удалён", show_alert=True)
+        return
+    if post["user_id"] == reporter_id:
+        await callback.answer("Нельзя пожаловаться на свой пост", show_alert=True)
+        return
+    if not save_report(post_id, reporter_id):
+        await callback.answer("Вы уже жаловались на этот пост", show_alert=True)
         return
 
-    parts = (message.text or "").split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer("Используй: /block <submission_id>")
+    reporter = callback.from_user
+    reporter_label = f"@{reporter.username}" if reporter.username else f"id {reporter_id}"
+    author_id = post["user_id"]
+    admin_text = (
+        f"🚩 <b>Жалоба на пост №{post_id}</b>\n\n"
+        f"👤 Автор: <code>{author_id}</code>\n"
+        f"📢 От: {escape(reporter_label)} (<code>{reporter_id}</code>)\n\n"
+        f"📝 {escape(post['text'])}"
+    )
+    if not ADMIN_IDS:
+        await callback.answer("Модераторы не настроены", show_alert=True)
         return
 
-    submission_id = int(parts[1])
-    if block_submission(submission_id):
-        await message.answer(f"Кружок {submission_id} заблокирован.")
-    else:
-        await message.answer("Не найдено.")
+    kb = admin_moderation_kb(post_id, author_id)
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, admin_text, reply_markup=kb)
+        except Exception:
+            logger.exception("Failed to notify admin %s", admin_id)
+
+    await callback.answer("Жалоба отправлена модераторам 🚩", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("adm:"))
+async def admin_action(callback: CallbackQuery, bot: Bot) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    action = parts[1]
+
+    if action == "skip":
+        await callback.message.edit_text(callback.message.text + "\n\n✅ <b>Пропущено</b>")
+        await callback.answer()
+        return
+
+    if action == "del":
+        post_id = int(parts[2])
+        post = get_post(post_id)
+        if delete_post(post_id):
+            if post:
+                try:
+                    await bot.send_message(
+                        post["user_id"],
+                        f"🗑 Ваш пост №{post_id} удалён модератором за нарушение правил.",
+                    )
+                except Exception:
+                    pass
+            await callback.message.edit_text(
+                callback.message.text + f"\n\n🗑 <b>Пост №{post_id} удалён</b>"
+            )
+            await callback.answer("Пост удалён")
+        else:
+            await callback.answer("Пост уже удалён", show_alert=True)
+        return
+
+    if action == "ban":
+        user_id = int(parts[2])
+        hours = int(parts[3])
+        if is_admin(user_id):
+            await callback.answer("Нельзя забанить админа", show_alert=True)
+            return
+        label = "навсегда" if hours <= 0 else f"на {hours} ч."
+        ban_user(user_id, hours, "жалоба на пост", callback.from_user.id)
+        try:
+            await bot.send_message(
+                user_id,
+                ban_message_text(user_id) or "🚫 Вы заблокированы в боте.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        await callback.message.edit_text(
+            callback.message.text + f"\n\n🔒 <b>Пользователь {user_id} забанен {label}</b>"
+        )
+        await callback.answer(f"Бан: {label}")
+        return
+
+    await callback.answer("Неизвестное действие")
+
+
+@dp.callback_query(F.data.startswith("chat:"))
+async def start_chat_handler(callback: CallbackQuery, bot: Bot) -> None:
+    post_id = int(callback.data.split(":")[1])
+    initiator_id = callback.from_user.id
+    chat_id, error = start_chat(post_id, initiator_id)
+    if error:
+        await callback.answer(error, show_alert=True)
+        return
+
+    chat = get_chat(chat_id)
+    post = get_post(chat["post_id"])
+    initiator_post = get_post(chat["initiator_post_id"])
+    owner_id = chat["owner_id"]
+
+    await callback.answer("💬 Чат начат!")
+    await callback.message.answer(
+        "💬 <b>Диалог начат!</b>\n\n"
+        "Пишите сообщения — они дойдут до собеседника.\n"
+        "🚪 Чтобы выйти — «Прекратить диалог».",
+        reply_markup=chat_kb(),
+    )
+
+    await bot.send_message(
+        owner_id,
+        "🔔 <b>К вам хотят пообщаться!</b>\n\n"
+        "Вот пост человека, который начал чат:",
+    )
+    await send_post(bot, owner_id, initiator_post, header="👤 Пост собеседника")
+    await bot.send_message(
+        owner_id,
+        "✉️ Ответьте сообщением — диалог открыт.\n"
+        "🚪 Для выхода: «Прекратить диалог».",
+        reply_markup=chat_kb(),
+    )
+
+
+@dp.message(F.text == BTN_MAIN_MENU)
+async def main_menu_from_anywhere(message: Message, state: FSMContext) -> None:
+    if get_active_chat(message.from_user.id):
+        await message.answer(
+            "💬 Вы в диалоге.\n"
+            "Чтобы выйти в меню — сначала «🚪 Прекратить диалог».",
+            reply_markup=chat_kb(),
+        )
+        return
+    await state.clear()
+    await message.answer("🏠 Главное меню", reply_markup=main_menu_kb())
+
+
+@dp.message(F.text == BTN_END_CHAT)
+async def end_chat_handler(message: Message, state: FSMContext, bot: Bot) -> None:
+    user_id = message.from_user.id
+    chat = get_active_chat(user_id)
+    if not chat:
+        await message.answer("ℹ️ Вы не в диалоге.", reply_markup=main_menu_kb())
+        return
+
+    ended = end_chat(chat["id"])
+    if not ended:
+        await message.answer("ℹ️ Диалог уже завершён.", reply_markup=main_menu_kb())
+        return
+
+    other = partner_id(ended, user_id)
+    await message.answer(
+        "👋 <b>Диалог завершён</b>\n\n⭐ Оцените собеседника:",
+        reply_markup=main_menu_kb(),
+    )
+    await message.answer("Ваша оценка 👇", reply_markup=rating_kb(ended["id"]))
+
+    await bot.send_message(
+        other,
+        "👋 <b>Собеседник завершил диалог</b>\n\n⭐ Оцените его:",
+        reply_markup=main_menu_kb(),
+    )
+    await bot.send_message(other, "Ваша оценка 👇", reply_markup=rating_kb(ended["id"]))
+
+
+@dp.callback_query(F.data.startswith("rate:"))
+async def rate_partner(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    chat_id = int(parts[1])
+    rating = int(parts[2])
+    if rating < 1 or rating > 5:
+        await callback.answer("Некорректная оценка")
+        return
+
+    chat = get_chat(chat_id)
+    if not chat:
+        await callback.answer("Диалог не найден")
+        return
+
+    user_id = callback.from_user.id
+    if user_id not in (chat["initiator_id"], chat["owner_id"]):
+        await callback.answer("Нет доступа")
+        return
+
+    target_post_id = rated_post_for_user(chat, user_id)
+    save_post_rating(target_post_id, user_id, rating, chat_id)
+    stars = "⭐" * rating
+    await callback.message.edit_text(f"🙏 <b>Спасибо!</b>\n\nВаша оценка: {rating}/5 {stars}")
+    await callback.answer("Оценка сохранена ✨")
+
+
+@dp.message(StateFilter(None), F.text)
+async def relay_chat_message(message: Message, bot: Bot) -> None:
+    if message.text in MENU_BUTTONS:
+        return
+
+    user_id = message.from_user.id
+    chat = get_active_chat(user_id)
+    if not chat:
+        return
+
+    other = partner_id(chat, user_id)
+    prefix = "💬 Собеседник:\n"
+    try:
+        await bot.send_message(other, prefix + message.text)
+    except Exception:
+        logger.exception("Failed to relay message to %s", other)
+        await message.answer("Не удалось доставить сообщение.")
+
+
+@dp.message(StateFilter(None), F.photo | F.video | F.voice | F.audio | F.document)
+async def relay_chat_media(message: Message, bot: Bot) -> None:
+    user_id = message.from_user.id
+    chat = get_active_chat(user_id)
+    if not chat:
+        return
+
+    other = partner_id(chat, user_id)
+    caption = "💬 Собеседник"
+    if message.caption:
+        caption += f":\n{message.caption}"
+
+    try:
+        if message.photo:
+            await bot.send_photo(other, message.photo[-1].file_id, caption=caption)
+        elif message.video:
+            await bot.send_video(other, message.video.file_id, caption=caption)
+        elif message.voice:
+            await bot.send_voice(other, message.voice.file_id, caption=caption)
+        elif message.audio:
+            await bot.send_audio(other, message.audio.file_id, caption=caption)
+        elif message.document:
+            await bot.send_document(other, message.document.file_id, caption=caption)
+    except Exception:
+        logger.exception("Failed to relay media to %s", other)
+        await message.answer("Не удалось доставить файл.")
 
 
 async def main() -> None:
     if not BOT_TOKEN:
-        raise RuntimeError("Set BOT_TOKEN env variable")
+        raise RuntimeError("BOT_TOKEN не задан. Положите токен в bot_token.txt")
 
     init_db()
-    bot = Bot(token=BOT_TOKEN)
-    await bot.set_my_commands(
-        [
-            BotCommand(command="start", description="Запуск и приветствие"),
-            BotCommand(command="menu", description="Главное меню"),
-            BotCommand(command="profile", description="Профиль и язык"),
-            BotCommand(command="random", description="Случайный кружок"),
-            BotCommand(command="my", description="Мой кружок"),
-            BotCommand(command="stats", description="Лимит и статистика"),
-            BotCommand(command="invite", description="Реферальная ссылка"),
-        ]
-    )
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
