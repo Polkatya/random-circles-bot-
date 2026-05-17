@@ -994,19 +994,17 @@ async def relay_media_to_partner(message: Message, bot: Bot) -> None:
         await message.answer("❌ Не удалось доставить файл собеседнику.")
 
 
-@dp.message(ActiveChatFilter(), F.text.not_in(CHAT_SKIP_TEXT))
-async def relay_chat_text_in_dialog(message: Message, state: FSMContext, bot: Bot) -> None:
+@dp.message(ActiveChatFilter(), ~F.text.in_(CHAT_SKIP_TEXT))
+async def relay_chat_all_in_dialog(message: Message, state: FSMContext, bot: Bot) -> None:
+    # Очищаем стейт на всякий случай, если пользователь застрял в создании поста
     await state.clear()
-    await relay_text_to_partner(message, bot)
-
-
-@dp.message(ActiveChatFilter())
-async def relay_chat_media_in_dialog(message: Message, state: FSMContext, bot: Bot) -> None:
-    # Игнорируем кнопки меню, чтобы они срабатывали как команды, а не пересылались
-    if message.text in CHAT_SKIP_TEXT:
-        return
-    await state.clear()
-    await relay_media_to_partner(message, bot)
+    
+    # Если это текст - пересылаем как текст
+    if message.text:
+        await relay_text_to_partner(message, bot)
+    # Если это медиа (фото, видео, кружок и т.д.) - пересылаем как медиа
+    else:
+        await relay_media_to_partner(message, bot)
 
 
 @dp.update.outer_middleware()
