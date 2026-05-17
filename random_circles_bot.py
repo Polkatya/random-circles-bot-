@@ -8,7 +8,8 @@ from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import CommandStart, StateFilter
+from aiogram.filters import BaseFilter, CommandObject, CommandStart, StateFilter
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -32,9 +33,11 @@ BTN_END_CHAT = "🚪 Прекратить диалог"
 BTN_MAIN_MENU = "🏠 В главное меню"
 BTN_BACK = "◀️ Назад"
 BTN_ACCEPT_RULES = "✅ Мне есть 18+ — принимаю правила"
+BTN_PREMIUM = "💎 Премиум"
 
 MAX_POST_LENGTH = 500
 ONLINE_THRESHOLD = timedelta(minutes=5)
+PREMIUM_HOURS_PER_REFERRAL = 1
 
 RULES_TEXT = (
     "📜 <b>Правила RandomCircle</b>\n\n"
@@ -53,10 +56,23 @@ RULES_TEXT = (
 MENU_BUTTONS = frozenset({
     BTN_CREATE_POST,
     BTN_VIEW_POSTS,
+    BTN_PREMIUM,
     BTN_END_CHAT,
     BTN_MAIN_MENU,
     BTN_BACK,
 })
+
+PREMIUM_TEXT = (
+    "💎 <b>Премиум RandomCircle</b>\n\n"
+    "С премиумом ваш пост <b>всегда выше остальных</b> — его видят первым "
+    "при просмотре анкет. Вы получите <b>намного больше просмотров</b>, "
+    "сообщений и чатов!\n\n"
+    "🎁 <b>Как получить бесплатно:</b>\n"
+    "Пригласите друга по своей ссылке. Когда он примет правила и зайдёт в бота — "
+    f"ваш пост будет в <b>ТОПе {PREMIUM_HOURS_PER_REFERRAL} час</b> за каждого друга.\n\n"
+    "⏱ Часы премиума <b>суммируются</b> — пригласили 5 друзей = 5 часов в топе.\n\n"
+    "👇 Ваша реферальная ссылка:"
+)
 
 
 def read_secret(path: str) -> str:
@@ -133,6 +149,12 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 UNIQUE (post_id, reporter_id)
             );
+
+            CREATE TABLE IF NOT EXISTS referrals (
+                referred_id INTEGER PRIMARY KEY,
+                referrer_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
         user_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
@@ -144,6 +166,10 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE users ADD COLUMN rules_accepted INTEGER NOT NULL DEFAULT 0"
             )
+        if "premium_until" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN premium_until TEXT")
+        if "pending_referrer_id" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN pending_referrer_id INTEGER")
         conn.commit()
 
 
@@ -191,7 +217,7 @@ def user_accepted_rules(user_id: int) -> bool:
         return bool(row and row[0])
 
 
-def accept_rules(user_id: int) -> None:
+def accept_rules(user_id: int) -> int | None:
     ensure_user(user_id)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute(
@@ -199,6 +225,150 @@ def accept_rules(user_id: int) -> None:
             (now_iso(), user_id),
         )
         conn.commit()
+    return process_pending_referral(user_id)
+
+
+async def notify_referrer_premium(bot: Bot, referrer_id: int) -> None:
+    try:
+        await bot.send_message(
+            referrer_id,
+            f"🎉 <b>Новый друг по вашей ссылке!</b>\n\n"
+            f"⏱ +{PREMIUM_HOURS_PER_REFERRAL} ч премиума — ваш пост в <b>ТОПе</b>!\n"
+            f"Приглашайте ещё — раздел «💎 Премиум».",
+        )
+    except Exception:
+        pass
+
+
+def save_pending_referral(user_id: int, referrer_id: int) -> None:
+    if user_id == referrer_id or referrer_id <= 0:
+        return
+    ensure_user(user_id)
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT referred_id FROM referrals WHERE referred_id = ?",
+            (user_id,),
+        ).fetchone()
+        if row:
+            return
+        conn.execute(
+            """
+            UPDATE users SET pending_referrer_id = ?
+            WHERE user_id = ? AND pending_referrer_id IS NULL
+            """,
+            (referrer_id, user_id),
+        )
+        conn.commit()
+
+
+def process_pending_referral(user_id: int) -> int | None:
+    """Возвращает referrer_id, если реферал засчитан."""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT pending_referrer_id FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row or not row["pending_referrer_id"]:
+            return None
+        referrer_id = int(row["pending_referrer_id"])
+        if referrer_id == user_id:
+            conn.execute(
+                "UPDATE users SET pending_referrer_id = NULL WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.commit()
+            return None
+        exists = conn.execute(
+            "SELECT 1 FROM referrals WHERE referred_id = ?",
+            (user_id,),
+        ).fetchone()
+        if exists:
+            conn.execute(
+                "UPDATE users SET pending_referrer_id = NULL WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.commit()
+            return None
+        conn.execute(
+            "INSERT INTO referrals (referred_id, referrer_id, created_at) VALUES (?, ?, ?)",
+            (user_id, referrer_id, now_iso()),
+        )
+        conn.execute(
+            "UPDATE users SET pending_referrer_id = NULL WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.commit()
+    add_premium_hours(referrer_id, PREMIUM_HOURS_PER_REFERRAL)
+    return referrer_id
+
+
+def add_premium_hours(user_id: int, hours: int) -> None:
+    ensure_user(user_id)
+    now = datetime.now(timezone.utc)
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT premium_until FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        base = now
+        if row and row[0]:
+            current = parse_iso(row[0])
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=timezone.utc)
+            if current > now:
+                base = current
+        new_until = (base + timedelta(hours=hours)).isoformat()
+        conn.execute(
+            "UPDATE users SET premium_until = ? WHERE user_id = ?",
+            (new_until, user_id),
+        )
+        conn.commit()
+
+
+def has_active_premium(user_id: int) -> bool:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT premium_until FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row or not row[0]:
+            return False
+        until = parse_iso(row[0])
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) >= until:
+            conn.execute(
+                "UPDATE users SET premium_until = NULL WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.commit()
+            return False
+        return True
+
+
+def get_premium_until(user_id: int) -> str | None:
+    if not has_active_premium(user_id):
+        return None
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT premium_until FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+
+def count_referrals(user_id: int) -> int:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM referrals WHERE referrer_id = ?",
+            (user_id,),
+        ).fetchone()
+        return int(row[0])
+
+
+def _now_sql() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def get_user_activity(user_id: int) -> dict:
@@ -349,17 +519,24 @@ def get_post_rating(post_id: int) -> tuple[float | None, int]:
 
 
 def list_posts_for_viewer(viewer_id: int, offset: int = 0) -> list[dict]:
+    ts = _now_sql()
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
             SELECT p.id, p.user_id, p.text, p.photo_file_id
             FROM posts p
+            JOIN users u ON u.user_id = p.user_id
             WHERE p.is_active = 1 AND p.user_id != ?
-            ORDER BY p.id DESC
+            ORDER BY
+                CASE
+                    WHEN u.premium_until IS NOT NULL AND u.premium_until > ? THEN 0
+                    ELSE 1
+                END,
+                p.id DESC
             LIMIT 1 OFFSET ?
             """,
-            (viewer_id, offset),
+            (viewer_id, ts, offset),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -606,6 +783,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=BTN_CREATE_POST)],
             [KeyboardButton(text=BTN_VIEW_POSTS)],
+            [KeyboardButton(text=BTN_PREMIUM)],
         ],
         resize_keyboard=True,
     )
@@ -672,6 +850,8 @@ def format_rating(post_id: int) -> str:
 def format_post_caption(post: dict, header: str = "") -> str:
     title = header or f"📄 Пост №{post['id']}"
     lines = [f"<b>{escape(title)}</b>"]
+    if has_active_premium(post["user_id"]):
+        lines.append("👑 <b>ТОП · Премиум</b>")
     lines.append(f"📝 {escape(post['text'])}")
     lines.append(format_rating(post["id"]))
     lines.append(format_author_status(post["user_id"]))
@@ -689,11 +869,34 @@ def rules_kb() -> ReplyKeyboardMarkup:
     )
 
 
+async def referral_link(bot: Bot, user_id: int) -> str:
+    me = await bot.get_me()
+    return f"https://t.me/{me.username}?start=ref_{user_id}"
+
+
+async def send_premium_info(message: Message, bot: Bot) -> None:
+    user_id = message.from_user.id
+    refs = count_referrals(user_id)
+    link = await referral_link(bot, user_id)
+    premium_line = "❌ Премиум не активен"
+    until = get_premium_until(user_id)
+    if until:
+        premium_line = f"✅ <b>Премиум активен</b> ещё ~{format_time_remaining(until)}"
+    text = (
+        f"{PREMIUM_TEXT}\n\n"
+        f"<code>{escape(link)}</code>\n\n"
+        f"{premium_line}\n"
+        f"👥 Приглашено друзей: <b>{refs}</b>"
+    )
+    await message.answer(text, reply_markup=main_menu_kb())
+
+
 async def send_welcome(message: Message) -> None:
     await message.answer(
         "👋 <b>Добро пожаловать!</b>\n\n"
         "✏️ <b>Сделать свой пост</b> — только текст и смайлики\n"
-        "🔍 <b>Смотреть посты</b> — листайте анкеты и начинайте чат\n\n"
+        "🔍 <b>Смотреть посты</b> — листайте анкеты и начинайте чат\n"
+        "💎 <b>Премиум</b> — пост в топе за приглашённых друзей\n\n"
         "💡 Сначала создайте пост, потом смотрите чужие и нажимайте «Начать чат»",
         reply_markup=main_menu_kb(),
     )
@@ -701,6 +904,80 @@ async def send_welcome(message: Message) -> None:
 
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+
+CHAT_SKIP_TEXT = MENU_BUTTONS | {BTN_END_CHAT}
+
+
+class ActiveChatFilter(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        if not message.from_user:
+            return False
+        return get_active_chat(message.from_user.id) is not None
+
+
+async def clear_user_fsm(bot: Bot, user_id: int) -> None:
+    key = StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id)
+    await storage.set_state(key, None)
+    await storage.set_data(key, {})
+
+
+async def relay_text_to_partner(message: Message, bot: Bot) -> None:
+    user_id = message.from_user.id
+    chat = get_active_chat(user_id)
+    if not chat or not message.text:
+        return
+    other = partner_id(chat, user_id)
+    try:
+        await bot.send_message(other, "💬 Собеседник:\n" + message.text)
+    except Exception:
+        logger.exception("Failed to relay message to %s", other)
+        await message.answer("Не удалось доставить сообщение.")
+
+
+async def relay_media_to_partner(message: Message, bot: Bot) -> None:
+    user_id = message.from_user.id
+    chat = get_active_chat(user_id)
+    if not chat:
+        return
+    other = partner_id(chat, user_id)
+    caption = "💬 Собеседник"
+    if message.caption:
+        caption += f":\n{message.caption}"
+    try:
+        if message.photo:
+            await bot.send_photo(other, message.photo[-1].file_id, caption=caption)
+        elif message.video:
+            await bot.send_video(other, message.video.file_id, caption=caption)
+        elif message.video_note:
+            await bot.send_message(other, "🎥 Собеседник отправил кружок:")
+            await bot.send_video_note(other, message.video_note.file_id)
+        elif message.voice:
+            await bot.send_voice(other, message.voice.file_id, caption=caption)
+        elif message.audio:
+            await bot.send_audio(other, message.audio.file_id, caption=caption)
+        elif message.document:
+            await bot.send_document(other, message.document.file_id, caption=caption)
+        elif message.sticker:
+            await bot.send_message(other, "💬 Собеседник:")
+            await bot.send_sticker(other, message.sticker.file_id)
+    except Exception:
+        logger.exception("Failed to relay media to %s", other)
+        await message.answer("Не удалось доставить файл.")
+
+
+@dp.message(ActiveChatFilter(), F.text.not_in(CHAT_SKIP_TEXT))
+async def relay_chat_text_in_dialog(message: Message, state: FSMContext, bot: Bot) -> None:
+    await state.clear()
+    await relay_text_to_partner(message, bot)
+
+
+@dp.message(
+    ActiveChatFilter(),
+    F.photo | F.video | F.video_note | F.voice | F.audio | F.document | F.sticker,
+)
+async def relay_chat_media_in_dialog(message: Message, state: FSMContext, bot: Bot) -> None:
+    await state.clear()
+    await relay_media_to_partner(message, bot)
 
 
 @dp.update.outer_middleware()
@@ -726,21 +1003,44 @@ async def track_activity(handler, event, data):
 
 
 @dp.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
+async def cmd_start(
+    message: Message, state: FSMContext, command: CommandObject, bot: Bot
+) -> None:
     await state.clear()
-    ensure_user(message.from_user.id)
-    if not user_accepted_rules(message.from_user.id):
-        await message.answer(RULES_TEXT, reply_markup=rules_kb())
+    user_id = message.from_user.id
+    ensure_user(user_id)
+    if command.args:
+        arg = command.args.strip()
+        if arg.startswith("ref_"):
+            try:
+                save_pending_referral(user_id, int(arg[4:]))
+            except ValueError:
+                pass
+    if user_accepted_rules(user_id):
+        referrer_id = process_pending_referral(user_id)
+        if referrer_id:
+            await notify_referrer_premium(bot, referrer_id)
+        await send_welcome(message)
         return
-    await send_welcome(message)
+    await message.answer(RULES_TEXT, reply_markup=rules_kb())
 
 
 @dp.message(F.text == BTN_ACCEPT_RULES)
-async def accept_rules_handler(message: Message, state: FSMContext) -> None:
-    accept_rules(message.from_user.id)
+async def accept_rules_handler(message: Message, state: FSMContext, bot: Bot) -> None:
+    user_id = message.from_user.id
+    referrer_id = accept_rules(user_id)
     await state.clear()
     await message.answer("✅ Спасибо! Правила приняты.", reply_markup=main_menu_kb())
+    if referrer_id:
+        await notify_referrer_premium(bot, referrer_id)
     await send_welcome(message)
+
+
+@dp.message(F.text == BTN_PREMIUM)
+async def premium_menu(message: Message, bot: Bot) -> None:
+    if not await require_rules(message):
+        return
+    await send_premium_info(message, bot)
 
 
 async def require_rules(message: Message) -> bool:
@@ -798,7 +1098,11 @@ async def create_post_no_media(message: Message) -> None:
 
 
 @dp.message(CreatePost.waiting_content, F.text)
-async def create_post_text(message: Message, state: FSMContext) -> None:
+async def create_post_text(message: Message, state: FSMContext, bot: Bot) -> None:
+    if get_active_chat(message.from_user.id):
+        await state.clear()
+        await relay_text_to_partner(message, bot)
+        return
     text = message.text.strip()
     if not text:
         await message.answer("⚠️ Текст не может быть пустым.")
@@ -1006,6 +1310,9 @@ async def start_chat_handler(callback: CallbackQuery, bot: Bot) -> None:
     initiator_post = get_post(chat["initiator_post_id"])
     owner_id = chat["owner_id"]
 
+    await clear_user_fsm(bot, initiator_id)
+    await clear_user_fsm(bot, owner_id)
+
     await callback.answer("💬 Чат начат!")
     await callback.message.answer(
         "💬 <b>Диалог начат!</b>\n\n"
@@ -1093,53 +1400,6 @@ async def rate_partner(callback: CallbackQuery) -> None:
     stars = "⭐" * rating
     await callback.message.edit_text(f"🙏 <b>Спасибо!</b>\n\nВаша оценка: {rating}/5 {stars}")
     await callback.answer("Оценка сохранена ✨")
-
-
-@dp.message(StateFilter(None), F.text)
-async def relay_chat_message(message: Message, bot: Bot) -> None:
-    if message.text in MENU_BUTTONS:
-        return
-
-    user_id = message.from_user.id
-    chat = get_active_chat(user_id)
-    if not chat:
-        return
-
-    other = partner_id(chat, user_id)
-    prefix = "💬 Собеседник:\n"
-    try:
-        await bot.send_message(other, prefix + message.text)
-    except Exception:
-        logger.exception("Failed to relay message to %s", other)
-        await message.answer("Не удалось доставить сообщение.")
-
-
-@dp.message(StateFilter(None), F.photo | F.video | F.voice | F.audio | F.document)
-async def relay_chat_media(message: Message, bot: Bot) -> None:
-    user_id = message.from_user.id
-    chat = get_active_chat(user_id)
-    if not chat:
-        return
-
-    other = partner_id(chat, user_id)
-    caption = "💬 Собеседник"
-    if message.caption:
-        caption += f":\n{message.caption}"
-
-    try:
-        if message.photo:
-            await bot.send_photo(other, message.photo[-1].file_id, caption=caption)
-        elif message.video:
-            await bot.send_video(other, message.video.file_id, caption=caption)
-        elif message.voice:
-            await bot.send_voice(other, message.voice.file_id, caption=caption)
-        elif message.audio:
-            await bot.send_audio(other, message.audio.file_id, caption=caption)
-        elif message.document:
-            await bot.send_document(other, message.document.file_id, caption=caption)
-    except Exception:
-        logger.exception("Failed to relay media to %s", other)
-        await message.answer("Не удалось доставить файл.")
 
 
 async def main() -> None:
