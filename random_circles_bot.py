@@ -964,29 +964,29 @@ async def relay_media_to_partner(message: Message, bot: Bot) -> None:
     if not chat:
         return
     other = partner_id(chat, user_id)
-    caption = "💬 Собеседник"
-    if message.caption:
-        caption += f":\n{message.caption}"
     try:
-        if message.photo:
-            await bot.send_photo(other, message.photo[-1].file_id, caption=caption)
-        elif message.video:
-            await bot.send_video(other, message.video.file_id, caption=caption)
-        elif message.video_note:
-            await bot.send_message(other, "🎥 Собеседник отправил кружок:")
-            await bot.send_video_note(other, message.video_note.file_id)
-        elif message.voice:
-            await bot.send_voice(other, message.voice.file_id, caption=caption)
-        elif message.audio:
-            await bot.send_audio(other, message.audio.file_id, caption=caption)
-        elif message.document:
-            await bot.send_document(other, message.document.file_id, caption=caption)
-        elif message.sticker:
-            await bot.send_message(other, "💬 Собеседник:")
-            await bot.send_sticker(other, message.sticker.file_id)
+        # Отправляем уведомление, что сейчас придет медиа
+        # Для кружков и стикеров это особенно полезно
+        prefix = "💬 Собеседник отправил "
+        if message.photo: prefix += "фото:"
+        elif message.video: prefix += "видео:"
+        elif message.video_note: prefix += "кружок:"
+        elif message.voice: prefix += "голосовое сообщение:"
+        elif message.sticker: prefix += "стикер:"
+        elif message.animation: prefix += "GIF:"
+        else: prefix += "сообщение:"
+        
+        await bot.send_message(other, prefix)
+        
+        # Пересылаем само сообщение (фото, видео, кружок и т.д.)
+        await bot.copy_message(
+            chat_id=other,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id
+        )
     except Exception:
-        logger.exception("Failed to relay media to %s", other)
-        await message.answer("Не удалось доставить файл.")
+        logging.exception("Failed to relay media to %s", other)
+        await message.answer("❌ Не удалось доставить файл.")
 
 
 @dp.message(ActiveChatFilter(), F.text.not_in(CHAT_SKIP_TEXT))
@@ -995,11 +995,9 @@ async def relay_chat_text_in_dialog(message: Message, state: FSMContext, bot: Bo
     await relay_text_to_partner(message, bot)
 
 
-@dp.message(
-    ActiveChatFilter(),
-    F.photo | F.video | F.video_note | F.voice | F.audio | F.document | F.sticker,
-)
+@dp.message(ActiveChatFilter())
 async def relay_chat_media_in_dialog(message: Message, state: FSMContext, bot: Bot) -> None:
+    # Этот хендлер поймает всё, что не попало в текстовый (фото, видео, кружки, файлы и т.д.)
     await state.clear()
     await relay_media_to_partner(message, bot)
 
