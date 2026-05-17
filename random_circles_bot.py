@@ -8,12 +8,13 @@ from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import BaseFilter, CommandObject, CommandStart, StateFilter
+from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -635,6 +636,20 @@ def rated_post_for_user(chat: dict, user_id: int) -> int:
     return chat["initiator_post_id"]
 
 
+def get_total_stats() -> dict:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        users_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        posts_count = conn.execute("SELECT COUNT(*) FROM posts WHERE is_active = 1").fetchone()[0]
+        chats_count = conn.execute("SELECT COUNT(*) FROM chats WHERE status = 'active'").fetchone()[0]
+        total_chats = conn.execute("SELECT COUNT(*) FROM chats").fetchone()[0]
+        return {
+            "users": users_count,
+            "active_posts": posts_count,
+            "active_chats": chats_count,
+            "total_chats": total_chats
+        }
+
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -1168,6 +1183,22 @@ async def view_posts(message: Message, state: FSMContext) -> None:
     )
 
 
+@dp.message(Command("admin_stats"))
+async def admin_stats_command(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+
+    stats = get_total_stats()
+    text = (
+        "📊 <b>Статистика бота</b>\n\n"
+        f"👥 Всего пользователей: <b>{stats['users']}</b>\n"
+        f"📝 Активных постов: <b>{stats['active_posts']}</b>\n"
+        f"💬 Активных чатов: <b>{stats['active_chats']}</b>\n"
+        f"📂 Всего диалогов за всё время: <b>{stats['total_chats']}</b>"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+
 @dp.callback_query(F.data.startswith("report:"))
 async def report_post(callback: CallbackQuery, bot: Bot) -> None:
     post_id = int(callback.data.split(":")[1])
@@ -1373,6 +1404,20 @@ async def main() -> None:
 
     init_db()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Запуск и приветствие"),
+            BotCommand(command="menu", description="Главное меню"),
+            BotCommand(command="profile", description="Профиль и язык"),
+            BotCommand(command="random", description="Случайный кружок"),
+            BotCommand(command="my", description="Мой кружок"),
+            BotCommand(command="stats", description="Лимит и статистика"),
+            BotCommand(command="invite", description="Реферальная ссылка"),
+            BotCommand(command="admin_stats", description="Статистика бота (админ)"),
+        ]
+    )
+
     await dp.start_polling(bot)
 
 
