@@ -24,7 +24,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
-DB_PATH = os.getenv("DB_PATH", "circles.db")
+DB_PATH = os.getenv("DB_PATH", "posts_chat.db")
 BOT_TOKEN_FILE = os.getenv("BOT_TOKEN_FILE", "bot_token.txt")
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "7704968798")
 ADMIN_IDS = {int(part.strip()) for part in ADMIN_IDS_RAW.split(",") if part.strip().isdigit()}
@@ -962,31 +962,36 @@ async def relay_media_to_partner(message: Message, bot: Bot) -> None:
     user_id = message.from_user.id
     chat = get_active_chat(user_id)
     if not chat:
+        logging.info(f"No active chat for user {user_id}, cannot relay media.")
         return
     other = partner_id(chat, user_id)
+    logging.info(f"Relaying media from {user_id} to {other}")
     try:
-        # Отправляем уведомление, что сейчас придет медиа
-        # Для кружков и стикеров это особенно полезно
-        prefix = "💬 Собеседник отправил "
-        if message.photo: prefix += "фото:"
-        elif message.video: prefix += "видео:"
-        elif message.video_note: prefix += "кружок:"
-        elif message.voice: prefix += "голосовое сообщение:"
-        elif message.sticker: prefix += "стикер:"
-        elif message.animation: prefix += "GIF:"
-        else: prefix += "сообщение:"
+        # Определяем тип медиа для уведомления
+        if message.photo: prefix = "🖼 Фото"
+        elif message.video: prefix = "📹 Видео"
+        elif message.video_note: prefix = "🎥 Кружок"
+        elif message.voice: prefix = "🎤 Голос"
+        elif message.sticker: prefix = "🧧 Стикер"
+        elif message.animation: prefix = "👾 GIF"
+        elif message.audio: prefix = "🎵 Аудио"
+        elif message.document: prefix = "📄 Файл"
+        else: prefix = "📦 Медиа"
         
-        await bot.send_message(other, prefix)
+        # Отправляем уведомление
+        await bot.send_message(other, f"💬 Собеседник отправил {prefix}:")
         
-        # Пересылаем само сообщение (фото, видео, кружок и т.д.)
+        # Пересылаем само сообщение
+        # copy_message - лучший способ переслать любой контент
         await bot.copy_message(
             chat_id=other,
             from_chat_id=message.chat.id,
             message_id=message.message_id
         )
-    except Exception:
-        logging.exception("Failed to relay media to %s", other)
-        await message.answer("❌ Не удалось доставить файл.")
+        logging.info(f"Successfully relayed media from {user_id} to {other}")
+    except Exception as e:
+        logging.exception(f"Failed to relay media from {user_id} to {other}: {e}")
+        await message.answer("❌ Не удалось доставить файл собеседнику.")
 
 
 @dp.message(ActiveChatFilter(), F.text.not_in(CHAT_SKIP_TEXT))
@@ -997,7 +1002,9 @@ async def relay_chat_text_in_dialog(message: Message, state: FSMContext, bot: Bo
 
 @dp.message(ActiveChatFilter())
 async def relay_chat_media_in_dialog(message: Message, state: FSMContext, bot: Bot) -> None:
-    # Этот хендлер поймает всё, что не попало в текстовый (фото, видео, кружки, файлы и т.д.)
+    # Игнорируем кнопки меню, чтобы они срабатывали как команды, а не пересылались
+    if message.text in CHAT_SKIP_TEXT:
+        return
     await state.clear()
     await relay_media_to_partner(message, bot)
 
