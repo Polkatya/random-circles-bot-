@@ -1069,6 +1069,10 @@ async def cmd_start(
 @dp.message(F.text == BTN_ACCEPT_RULES)
 async def accept_rules_handler(message: Message, state: FSMContext, bot: Bot) -> None:
     user_id = message.from_user.id
+    # Сначала сбрасываем кэш, чтобы принудительно обновить статус
+    if user_id in RULES_ACCEPTED_CACHE:
+        del RULES_ACCEPTED_CACHE[user_id]
+        
     referrer_id = accept_rules(user_id)
     await state.clear()
     await message.answer("✅ Правила приняты.")
@@ -1085,8 +1089,12 @@ async def premium_menu(message: Message, bot: Bot) -> None:
 
 
 async def require_rules(message: Message) -> bool:
-    if user_accepted_rules(message.from_user.id):
+    user_id = message.from_user.id
+    if user_accepted_rules(user_id):
         return True
+    
+    # Если правила не приняты, очищаем стейт и шлем правила
+    # Это предотвратит "застревание" в стейтах создания поста
     await message.answer(RULES_TEXT, reply_markup=rules_kb())
     return False
 
