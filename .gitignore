@@ -1,0 +1,10 @@
+bot_token.txt
+circles.db
+__pycache__/
+*.pyc
+sessions/
+.idea/
+*.session
+*.session-journal
+cap.jpg
+*.log
