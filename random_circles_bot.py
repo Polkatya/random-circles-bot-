@@ -96,6 +96,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", read_secret(BOT_TOKEN_FILE))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Кэш для принятых правил (user_id -> bool)
+RULES_ACCEPTED_CACHE: dict[int, bool] = {}
+
 # Следующий пост при нажатии «Смотреть посты» (по user_id).
 VIEWER_OFFSET: dict[int, int] = {}
 
@@ -221,12 +224,18 @@ def touch_chat_activity(user_id: int) -> None:
 
 
 def user_accepted_rules(user_id: int) -> bool:
+    if user_id in RULES_ACCEPTED_CACHE:
+        return RULES_ACCEPTED_CACHE[user_id]
+    
     with closing(sqlite3.connect(DB_PATH)) as conn:
         row = conn.execute(
             "SELECT rules_accepted FROM users WHERE user_id = ?",
             (user_id,),
         ).fetchone()
-        return bool(row and row[0])
+        accepted = bool(row and row[0])
+        if accepted:
+            RULES_ACCEPTED_CACHE[user_id] = True
+        return accepted
 
 
 def accept_rules(user_id: int) -> int | None:
@@ -237,6 +246,7 @@ def accept_rules(user_id: int) -> int | None:
             (now_iso(), user_id),
         )
         conn.commit()
+    RULES_ACCEPTED_CACHE[user_id] = True
     return process_pending_referral(user_id)
 
 
@@ -996,8 +1006,12 @@ async def relay_media_to_partner(message: Message, bot: Bot) -> None:
 
 @dp.message(ActiveChatFilter(), ~F.text.in_(CHAT_SKIP_TEXT))
 async def relay_chat_all_in_dialog(message: Message, state: FSMContext, bot: Bot) -> None:
+    user_id = message.from_user.id
     # Очищаем стейт на всякий случай, если пользователь застрял в создании поста
-    await state.clear()
+    current_state = await state.get_state()
+    if current_state:
+        logging.info(f"Clearing state {current_state} for user {user_id} in active chat")
+        await state.clear()
     
     # Если это текст - пересылаем как текст
     if message.text:
@@ -1123,11 +1137,23 @@ async def create_post_no_media(message: Message) -> None:
 
 @dp.message(CreatePost.waiting_content, F.text)
 async def create_post_text(message: Message, state: FSMContext, bot: Bot) -> None:
-    if get_active_chat(message.from_user.id):
+    user_id = message.from_user.id
+    if get_active_chat(user_id):
         await state.clear()
         await relay_text_to_partner(message, bot)
         return
     text = message.text.strip()
+    if text in MENU_BUTTONS:
+        await state.clear()
+        # Если пользователь нажал кнопку меню во время создания поста - отменяем создание
+        if text == BTN_VIEW_POSTS or text == "🔍 Смотреть посты":
+            await view_posts(message, state)
+        elif text == BTN_PREMIUM:
+            await premium_menu(message, bot)
+        else:
+            await refresh_main_keyboard(message, "🏠 Меню")
+        return
+    
     if not text:
         await message.answer("⚠️ Текст не может быть пустым.")
         return
