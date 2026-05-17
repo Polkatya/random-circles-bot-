@@ -20,6 +20,7 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
 DB_PATH = os.getenv("DB_PATH", "circles.db")
@@ -27,13 +28,20 @@ BOT_TOKEN_FILE = os.getenv("BOT_TOKEN_FILE", "bot_token.txt")
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "7704968798")
 ADMIN_IDS = {int(part.strip()) for part in ADMIN_IDS_RAW.split(",") if part.strip().isdigit()}
 
-BTN_CREATE_POST = "✏️ Сделать свой пост"
-BTN_VIEW_POSTS = "🔍 Смотреть посты"
-BTN_END_CHAT = "🚪 Прекратить диалог"
-BTN_MAIN_MENU = "🏠 В главное меню"
+BTN_CREATE_POST = "✏️ Пост"
+BTN_VIEW_POSTS = "🔍 Смотреть"
+BTN_END_CHAT = "🚪 Выйти"
 BTN_BACK = "◀️ Назад"
-BTN_ACCEPT_RULES = "✅ Мне есть 18+ — принимаю правила"
+BTN_ACCEPT_RULES = "✅ 18+ Принимаю"
 BTN_PREMIUM = "💎 Премиум"
+
+# Старые подписи кнопок (если клавиатура не обновилась у пользователя)
+LEGACY_MENU = frozenset({
+    "✏️ Сделать свой пост",
+    "🔍 Смотреть посты",
+    "🚪 Прекратить диалог",
+    "🏠 В главное меню",
+})
 
 MAX_POST_LENGTH = 500
 ONLINE_THRESHOLD = timedelta(minutes=5)
@@ -58,9 +66,9 @@ MENU_BUTTONS = frozenset({
     BTN_VIEW_POSTS,
     BTN_PREMIUM,
     BTN_END_CHAT,
-    BTN_MAIN_MENU,
     BTN_BACK,
-})
+    BTN_ACCEPT_RULES,
+}) | LEGACY_MENU
 
 PREMIUM_TEXT = (
     "💎 <b>Премиум RandomCircle</b>\n\n"
@@ -437,35 +445,6 @@ def format_time_ago(iso_value: str | None) -> str | None:
     return f"{months} мес. назад"
 
 
-def format_author_status(user_id: int) -> str:
-    activity = get_user_activity(user_id)
-    lines = []
-
-    if get_active_chat(user_id):
-        lines.append("🔴 <b>Сейчас в диалоге</b>")
-
-    active_at = activity.get("last_active_at")
-    if active_at:
-        dt = parse_iso(active_at)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        if datetime.now(timezone.utc) - dt <= ONLINE_THRESHOLD:
-            lines.append("🟢 <b>В боте:</b> сейчас онлайн")
-        else:
-            lines.append(f"🕐 <b>В боте:</b> {format_time_ago(active_at)}")
-    else:
-        lines.append("🕐 <b>В боте:</b> давно не заходил")
-
-    chat_at = activity.get("last_chat_at")
-    if chat_at:
-        lines.append(f"💬 <b>Последний чат:</b> {format_time_ago(chat_at)}")
-    else:
-        lines.append("💬 <b>Последний чат:</b> ещё не было")
-
-    lines.append("<i>ℹ️ По активности в боте (не статус Telegram)</i>")
-    return "\n".join(lines)
-
-
 def get_active_post(user_id: int) -> dict | None:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
@@ -596,7 +575,7 @@ def start_chat(post_id: int, initiator_id: int) -> tuple[int | None, str | None]
         return None, "Сначала создайте свой пост — без него нельзя начать чат."
 
     if get_active_chat(initiator_id):
-        return None, "Вы уже в диалоге. Завершите его кнопкой «Прекратить диалог»."
+        return None, "Вы уже в диалоге. Завершите его кнопкой «Выйти»."
     if get_active_chat(owner_id):
         return None, "Автор поста сейчас занят в другом диалоге."
 
@@ -784,11 +763,14 @@ def admin_moderation_kb(post_id: int, author_id: int) -> InlineKeyboardMarkup:
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_CREATE_POST)],
-            [KeyboardButton(text=BTN_VIEW_POSTS)],
-            [KeyboardButton(text=BTN_PREMIUM)],
+            [
+                KeyboardButton(text=BTN_CREATE_POST),
+                KeyboardButton(text=BTN_VIEW_POSTS),
+                KeyboardButton(text=BTN_PREMIUM),
+            ],
         ],
         resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -801,11 +783,9 @@ def back_kb() -> ReplyKeyboardMarkup:
 
 def chat_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_END_CHAT)],
-            [KeyboardButton(text=BTN_MAIN_MENU)],
-        ],
+        keyboard=[[KeyboardButton(text=BTN_END_CHAT)]],
         resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -827,8 +807,10 @@ def rating_kb(chat_id: int) -> InlineKeyboardMarkup:
 def post_actions_kb(post_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="💬 Начать чат", callback_data=f"chat:{post_id}")],
-            [InlineKeyboardButton(text="🚩 Пожаловаться", callback_data=f"report:{post_id}")],
+            [
+                InlineKeyboardButton(text="💬 Чат", callback_data=f"chat:{post_id}"),
+                InlineKeyboardButton(text="🚩 Жалоба", callback_data=f"report:{post_id}"),
+            ],
         ]
     )
 
@@ -844,22 +826,47 @@ def next_viewer_offset(user_id: int, total: int) -> int:
 def format_rating(post_id: int) -> str:
     avg, count = get_post_rating(post_id)
     if avg is None:
-        return "⭐ Оценка: пока нет отзывов"
-    word = "отзыв" if count % 10 == 1 and count % 100 != 11 else "отзывов"
-    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
-        word = "отзыва"
-    return f"⭐ Оценка: {avg}/5 · {count} {word}"
+        return "⭐ —"
+    return f"⭐ {avg}/5 ({count})"
+
+
+def format_author_status(user_id: int) -> str:
+    activity = get_user_activity(user_id)
+    bits = []
+    if get_active_chat(user_id):
+        bits.append("🔴 в диалоге")
+    active_at = activity.get("last_active_at")
+    if active_at:
+        dt = parse_iso(active_at)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - dt <= ONLINE_THRESHOLD:
+            bits.append("🟢 онлайн")
+        else:
+            bits.append(f"🕐 {format_time_ago(active_at)}")
+    chat_at = activity.get("last_chat_at")
+    if chat_at:
+        bits.append(f"💬 {format_time_ago(chat_at)}")
+    return " · ".join(bits) if bits else ""
 
 
 def format_post_caption(post: dict, header: str = "") -> str:
-    title = header or f"📄 Пост №{post['id']}"
-    lines = [f"<b>{escape(title)}</b>"]
+    parts = []
+    if header:
+        parts.append(f"<b>{escape(header)}</b>")
     if has_active_premium(post["user_id"]):
-        lines.append("👑 <b>ТОП · Премиум</b>")
-    lines.append(f"📝 {escape(post['text'])}")
-    lines.append(format_rating(post["id"]))
-    lines.append(format_author_status(post["user_id"]))
-    return "\n\n".join(lines)
+        parts.append("👑 ТОП")
+    parts.append(escape(post["text"].strip()))
+    parts.append(format_rating(post["id"]))
+    status = format_author_status(post["user_id"])
+    if status:
+        parts.append(status)
+    return "\n".join(parts)
+
+
+async def refresh_main_keyboard(message: Message, text: str) -> None:
+    await message.answer(text, reply_markup=ReplyKeyboardRemove())
+    await message.answer("\u2063", reply_markup=main_menu_kb())
 
 
 async def send_post(bot: Bot, chat_id: int, post: dict, header: str = "") -> None:
@@ -896,20 +903,18 @@ async def send_premium_info(message: Message, bot: Bot) -> None:
 
 
 async def send_welcome(message: Message) -> None:
-    await message.answer(
-        "👋 <b>Добро пожаловать!</b>\n\n"
-        "✏️ <b>Сделать свой пост</b> — только текст и смайлики\n"
-        "🔍 <b>Смотреть посты</b> — каждое нажатие покажет новый пост\n"
-        "💎 <b>Премиум</b> — пост в топе за приглашённых друзей\n\n"
-        "💡 Сначала создайте пост, потом смотрите чужие и нажимайте «Начать чат»",
-        reply_markup=main_menu_kb(),
+    await refresh_main_keyboard(
+        message,
+        "👋 <b>RandomCircle</b>\n"
+        "✏️ Пост · 🔍 Смотреть · 💎 Премиум\n"
+        "Создайте пост → смотрите чужие → жмите «Чат» под постом",
     )
 
 
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-CHAT_SKIP_TEXT = MENU_BUTTONS | {BTN_END_CHAT}
+CHAT_SKIP_TEXT = MENU_BUTTONS | {BTN_END_CHAT, "🚪 Прекратить диалог"}
 
 
 class ActiveChatFilter(BaseFilter):
@@ -1034,7 +1039,7 @@ async def accept_rules_handler(message: Message, state: FSMContext, bot: Bot) ->
     user_id = message.from_user.id
     referrer_id = accept_rules(user_id)
     await state.clear()
-    await message.answer("✅ Спасибо! Правила приняты.", reply_markup=main_menu_kb())
+    await message.answer("✅ Правила приняты.")
     if referrer_id:
         await notify_referrer_premium(bot, referrer_id)
     await send_welcome(message)
@@ -1054,7 +1059,7 @@ async def require_rules(message: Message) -> bool:
     return False
 
 
-@dp.message(F.text == BTN_CREATE_POST)
+@dp.message(F.text.in_({BTN_CREATE_POST, "✏️ Сделать свой пост"}))
 async def create_post_start(message: Message, state: FSMContext) -> None:
     if not await require_rules(message):
         return
@@ -1078,16 +1083,13 @@ async def create_post_start(message: Message, state: FSMContext) -> None:
 @dp.message(CreatePost.waiting_content, F.text == BTN_BACK)
 async def create_post_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(
-        "↩️ Создание поста отменено.",
-        reply_markup=main_menu_kb(),
-    )
+    await refresh_main_keyboard(message, "↩️ Отменено")
 
 
-@dp.message(CreatePost.waiting_content, F.text == BTN_MAIN_MENU)
+@dp.message(CreatePost.waiting_content, F.text == "🏠 В главное меню")
 async def create_post_to_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("🏠 Главное меню", reply_markup=main_menu_kb())
+    await refresh_main_keyboard(message, "🏠 Меню")
 
 
 @dp.message(
@@ -1120,7 +1122,7 @@ async def create_post_text(message: Message, state: FSMContext, bot: Bot) -> Non
     post_id = create_post(message.from_user.id, text)
     await state.clear()
     await message.answer(
-        f"✅ <b>Пост опубликован!</b> №{post_id}\n\n📝 {escape(text)}",
+        f"✅ <b>Опубликовано</b>\n{escape(text)}",
         reply_markup=main_menu_kb(),
     )
 
@@ -1133,7 +1135,7 @@ async def create_post_invalid(message: Message) -> None:
     )
 
 
-@dp.message(F.text == BTN_VIEW_POSTS)
+@dp.message(F.text.in_({BTN_VIEW_POSTS, "🔍 Смотреть посты"}))
 async def view_posts(message: Message, state: FSMContext) -> None:
     if not await require_rules(message):
         return
@@ -1284,7 +1286,7 @@ async def start_chat_handler(callback: CallbackQuery, bot: Bot) -> None:
     await callback.message.answer(
         "💬 <b>Диалог начат!</b>\n\n"
         "Пишите сообщения — они дойдут до собеседника.\n"
-        "🚪 Чтобы выйти — «Прекратить диалог».",
+        "🚪 Выход — «Выйти».",
         reply_markup=chat_kb(),
     )
 
@@ -1293,29 +1295,25 @@ async def start_chat_handler(callback: CallbackQuery, bot: Bot) -> None:
         "🔔 <b>К вам хотят пообщаться!</b>\n\n"
         "Вот пост человека, который начал чат:",
     )
-    await send_post(bot, owner_id, initiator_post, header="👤 Пост собеседника")
+    await send_post(bot, owner_id, initiator_post, header="👤 Собеседник")
     await bot.send_message(
         owner_id,
         "✉️ Ответьте сообщением — диалог открыт.\n"
-        "🚪 Для выхода: «Прекратить диалог».",
+        "🚪 Выход — «Выйти».",
         reply_markup=chat_kb(),
     )
 
 
-@dp.message(F.text == BTN_MAIN_MENU)
-async def main_menu_from_anywhere(message: Message, state: FSMContext) -> None:
+@dp.message(F.text == "🏠 В главное меню")
+async def legacy_main_menu(message: Message, state: FSMContext) -> None:
     if get_active_chat(message.from_user.id):
-        await message.answer(
-            "💬 Вы в диалоге.\n"
-            "Чтобы выйти в меню — сначала «🚪 Прекратить диалог».",
-            reply_markup=chat_kb(),
-        )
+        await message.answer("💬 Сначала «Выйти».", reply_markup=chat_kb())
         return
     await state.clear()
-    await message.answer("🏠 Главное меню", reply_markup=main_menu_kb())
+    await refresh_main_keyboard(message, "🏠 Меню")
 
 
-@dp.message(F.text == BTN_END_CHAT)
+@dp.message(F.text.in_({BTN_END_CHAT, "🚪 Прекратить диалог"}))
 async def end_chat_handler(message: Message, state: FSMContext, bot: Bot) -> None:
     user_id = message.from_user.id
     chat = get_active_chat(user_id)
