@@ -831,17 +831,18 @@ async def start_exchange(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("next_"))
 async def next_profile_callback(query: CallbackQuery, state: FSMContext):
+    await query.answer()  # Сразу отвечаем на callback
     current_idx = int(query.data.split("_")[1])
     data = await state.get_data()
     users_list = data.get("users_list")
     next_idx = current_idx + 1
     
     await show_user_profile(query, query.from_user.id, users_list, next_idx, state)
-    await query.answer()
 
 
 @dp.callback_query(F.data.startswith("exchange_"))
 async def exchange_callback(query: CallbackQuery, state: FSMContext):
+    await query.answer()  # Сразу отвечаем на callback
     initiator_id = query.from_user.id
     target_id = int(query.data.split("_")[1])
 
@@ -859,7 +860,6 @@ async def exchange_callback(query: CallbackQuery, state: FSMContext):
     await state.update_data(target_id=target_id, exchange_files=[])
     await state.set_state(ExchangeBot.waiting_exchange_files)
 
-    await query.answer()
     await query.message.answer(
         f"📝 Пришлите 5 файлов по тематике: «{escape(target_what_seek)}»\n"
         f"После этого обмен произойдёт автоматически!"
@@ -973,6 +973,7 @@ async def got_exchange_file_error(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("report_"))
 async def report_callback(query: CallbackQuery, state: FSMContext):
+    await query.answer()  # Сразу отвечаем на callback
     reporter_id = query.from_user.id
     reported_user_id = int(query.data.split("_")[1])
     
@@ -988,11 +989,11 @@ async def report_callback(query: CallbackQuery, state: FSMContext):
     ])
     
     await query.message.answer("⚠️ Выберите причину жалобы:", reply_markup=keyboard)
-    await query.answer()
 
 
 @dp.callback_query(F.data.startswith("rtype_"))
 async def report_type_callback(query: CallbackQuery, state: FSMContext):
+    await query.answer()  # Сразу отвечаем на callback
     reporter_id = query.from_user.id
     report_type = query.data.split("_")[1]
     
@@ -1009,11 +1010,11 @@ async def report_type_callback(query: CallbackQuery, state: FSMContext):
         await query.message.answer("📝 Опишите проблему:")
     else:
         await save_report(query, state)
-    await query.answer()
 
 
 @dp.callback_query(F.data.startswith("like_"))
 async def like_callback(query: CallbackQuery, state: FSMContext):
+    await query.answer()  # Сразу отвечаем на callback
     from_user_id = query.from_user.id
     to_user_id = int(query.data.split("_")[1])
     
@@ -1033,6 +1034,7 @@ async def like_callback(query: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("dislike_"))
 async def dislike_callback(query: CallbackQuery, state: FSMContext):
+    await query.answer()  # Сразу отвечаем на callback
     from_user_id = query.from_user.id
     to_user_id = int(query.data.split("_")[1])
     
@@ -1052,12 +1054,12 @@ async def dislike_callback(query: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("msg_"))
 async def message_callback(query: CallbackQuery, state: FSMContext):
+    await query.answer()  # Сразу отвечаем на callback
     to_user_id = int(query.data.split("_")[1])
     
     await state.update_data(to_user_id=to_user_id)
     await state.set_state(ExchangeBot.waiting_message)
     await query.message.answer("💬 Напиши сообщение, которое хочешь отправить:")
-    await query.answer()
 
 @dp.message(ExchangeBot.waiting_message, F.text)
 async def send_user_message(message: Message, state: FSMContext):
@@ -1091,15 +1093,16 @@ async def send_user_message(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("reply_"))
 async def reply_callback(query: CallbackQuery, state: FSMContext):
+    await query.answer()  # Сразу отвечаем на callback
     to_user_id = int(query.data.split("_")[1])
     
     await state.update_data(to_user_id=to_user_id)
     await state.set_state(ExchangeBot.waiting_message)
     await query.message.answer("💬 Напиши ответ:")
-    await query.answer()
 
 @dp.callback_query(F.data.startswith("delpost_"))
 async def delete_post_callback(query: CallbackQuery, state: FSMContext):
+    await query.answer()  # Сразу отвечаем на callback
     if query.from_user.id not in ADMIN_IDS:
         await query.answer("Ты не админ!", show_alert=True)
         return
@@ -1111,6 +1114,7 @@ async def delete_post_callback(query: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("ban1_"))
 async def ban1_callback(query: CallbackQuery, state: FSMContext):
+    await query.answer()  # Сразу отвечаем на callback
     if query.from_user.id not in ADMIN_IDS:
         await query.answer("Ты не админ!", show_alert=True)
         return
@@ -1128,6 +1132,7 @@ async def ban1_callback(query: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("ban7_"))
 async def ban7_callback(query: CallbackQuery, state: FSMContext):
+    await query.answer()  # Сразу отвечаем на callback
     if query.from_user.id not in ADMIN_IDS:
         await query.answer("Ты не админ!", show_alert=True)
         return
@@ -1145,6 +1150,7 @@ async def ban7_callback(query: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("noaction_"))
 async def noaction_callback(query: CallbackQuery, state: FSMContext):
+    await query.answer()  # Сразу отвечаем на callback
     if query.from_user.id not in ADMIN_IDS:
         await query.answer("Ты не админ!", show_alert=True)
         return
