@@ -79,10 +79,10 @@ with closing(sqlite3.connect(DB_PATH)) as conn:
     columns = [row[1] for row in cursor.fetchall()]
     print(f"Столбцы в users: {columns}")
     
-    for col in ["what_seek", "what_give", "is_premium", "premium_until", "rating"]:
+    for col in ["what_seek", "what_give", "is_premium", "premium_until", "rating", "strikes"]:
         if col not in columns:
             print(f"Добавляем столбец {col}...")
-            if col in ["is_premium", "rating"]:
+            if col in ["is_premium", "rating", "strikes"]:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {col} INTEGER DEFAULT 0")
             else:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")

@@ -43,6 +43,39 @@ BTN_PREMIUM = "💎 Премиум"
 
 MAX_FILES_FOR_EXCHANGE = 5
 
+# Список запрещённых ключевых слов (можно дополнять)
+FORBIDDEN_KEYWORDS = [
+    "цп", "детское порно", "child porn", "cp", "лои", "лоли", "шота",
+    "несовершеннолетние", "ребенок", "дети", "подросток", "подростков",
+    "несовершеннолетняя", "несовершеннолетний", "lolita", "loli", "shota",
+    "нсфл детей", "нсфл ребенок", "детское"
+]
+
+def check_forbidden_content(text: str) -> bool:
+    """Проверяет, содержит ли текст запрещённые ключевые слова"""
+    if not text:
+        return False
+    text_lower = text.lower()
+    for keyword in FORBIDDEN_KEYWORDS:
+        if keyword.lower() in text_lower:
+            return True
+    return False
+
+def get_user_strikes(user_id: int) -> int:
+    """Получает количество предупреждений пользователя"""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute("SELECT strikes FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        return row[0] if row else 0
+
+def add_user_strike(user_id: int) -> int:
+    """Добавляет предупреждение пользователю и возвращает новое количество"""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        current_strikes = get_user_strikes(user_id)
+        new_strikes = current_strikes + 1
+        conn.execute("UPDATE users SET strikes = ? WHERE user_id = ?", (new_strikes, user_id))
+        conn.commit()
+        return new_strikes
+
 RULES_TEXT = (
     "📜 <b>Правила 2D-Обмен</b>\n\n"
     "🔞 <b>СТРОГО ЗАПРЕЩЕНО: контент с лицами младше 18 лет (даже в анимации)! За нарушение — БАН НАВСЕГДА!</b>\n\n"
@@ -120,6 +153,7 @@ def init_db() -> None:
                 is_premium INTEGER DEFAULT 0,
                 premium_until TEXT,
                 rating INTEGER DEFAULT 0,
+                strikes INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL
             );
 
@@ -195,6 +229,10 @@ def init_db() -> None:
             pass
         try:
             conn.execute("ALTER TABLE users ADD COLUMN rating INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN strikes INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
             pass
         try:
@@ -562,8 +600,31 @@ async def got_what_seek(message: Message, state: FSMContext):
     user_id = message.from_user.id
     logger.info(f"Получено что ищет пользователь {user_id}: {message.text}")
     what_seek = message.text
-    set_what_seek(user_id, what_seek)
     
+    # Проверка на запрещённый контент
+    if check_forbidden_content(what_seek):
+        strikes = add_user_strike(user_id)
+        if strikes >= 2:
+            # Забаним пользователя при повторном нарушении
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                conn.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (user_id,))
+                conn.commit()
+            await message.answer(
+                "❌ <b>ВАША АНКЕТА СОДЕРЖИТ ЗАПРЕЩЁННЫЙ КОНТЕНТ!</b>\n\n"
+                "⚠️ Вы нарушили правила повторно — вы заблокированы навсегда!\n"
+                "‼️ Жалоба отправлена в Telegram и соответствующие органы."
+            )
+            await state.clear()
+            return
+        else:
+            await message.answer(
+                "⚠️ <b>ВНИМАНИЕ! ЗАПРЕЩЁННЫЙ КОНТЕНТ!</b>\n\n"
+                "❌ Вы указали запрещённую тематику!\n"
+                "‼️ При повторном нарушении — жалоба будет отправлена в Telegram и органы!"
+            )
+            return
+    
+    set_what_seek(user_id, what_seek)
     logger.info(f"Устанавливаем состояние waiting_what_give для пользователя {user_id}")
     await state.set_state(ExchangeBot.waiting_what_give)
     await message.answer(
@@ -576,8 +637,31 @@ async def got_what_give(message: Message, state: FSMContext):
     user_id = message.from_user.id
     logger.info(f"Получено что даёт пользователь {user_id}: {message.text}")
     what_give = message.text
-    set_what_give(user_id, what_give)
     
+    # Проверка на запрещённый контент
+    if check_forbidden_content(what_give):
+        strikes = add_user_strike(user_id)
+        if strikes >= 2:
+            # Забаним пользователя при повторном нарушении
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                conn.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (user_id,))
+                conn.commit()
+            await message.answer(
+                "❌ <b>ВАША АНКЕТА СОДЕРЖИТ ЗАПРЕЩЁННЫЙ КОНТЕНТ!</b>\n\n"
+                "⚠️ Вы нарушили правила повторно — вы заблокированы навсегда!\n"
+                "‼️ Жалоба отправлена в Telegram и соответствующие органы."
+            )
+            await state.clear()
+            return
+        else:
+            await message.answer(
+                "⚠️ <b>ВНИМАНИЕ! ЗАПРЕЩЁННЫЙ КОНТЕНТ!</b>\n\n"
+                "❌ Вы указали запрещённую тематику!\n"
+                "‼️ При повторном нарушении — жалоба будет отправлена в Telegram и органы!"
+            )
+            return
+    
+    set_what_give(user_id, what_give)
     # Сбросим старые файлы, чтобы не было конфликтов
     logger.info(f"Сбрасываем старые файлы для пользователя {user_id}")
     set_user_files_inactive(user_id)
